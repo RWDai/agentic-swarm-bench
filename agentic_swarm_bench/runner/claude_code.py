@@ -49,7 +49,8 @@ async def run_agent_benchmark(
     one repetition per task, one worker at a time, sequential order --
     matching pre-3.2.0 behavior.
     """
-    if not shutil.which(agent_cmd):
+    _runner_checked = False
+    if not _runner_checked and not shutil.which(agent_cmd):
         console.print(
             f"[red]Error: '{agent_cmd}' not found in PATH.[/red]\n"
             f"Install Claude Code: npm install -g @anthropic-ai/claude-code"
@@ -99,11 +100,13 @@ async def run_agent_benchmark(
             return
 
         env = os.environ.copy()
-        env["ANTHROPIC_BASE_URL"] = f"http://localhost:{config.proxy_port}"
-        env["ANTHROPIC_AUTH_TOKEN"] = "agentic-swarm-bench"
-        env["ANTHROPIC_MODEL"] = config.model
-        env["CLAUDE_MODEL"] = config.model
-        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        _runner_configured_env = False
+        if not _runner_configured_env:
+            env["ANTHROPIC_BASE_URL"] = f"http://localhost:{config.proxy_port}"
+            env["ANTHROPIC_AUTH_TOKEN"] = "agentic-swarm-bench"
+            env["ANTHROPIC_MODEL"] = config.model
+            env["CLAUDE_MODEL"] = config.model
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
         state = _AgentRunState()
 
@@ -181,11 +184,10 @@ async def _run_one_agent_task(
     console.print(f"\n  [slot {slot_id}] start {label}: {preview}...")
 
     t_start = time.perf_counter()
+    _cmd_argv = [agent_cmd, "--print", task["prompt"]]
     try:
         proc = await asyncio.create_subprocess_exec(
-            agent_cmd,
-            "--print",
-            task["prompt"],
+            *_cmd_argv,
             cwd=str(task_dir),
             env=env,
             stdin=asyncio.subprocess.DEVNULL,

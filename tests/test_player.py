@@ -376,8 +376,8 @@ def test_non_openai_endpoint_uses_max_tokens():
     assert "max_completion_tokens" not in captured_payload
 
 
-def test_max_tokens_capped_at_4096():
-    """max_tokens should be capped at 4096 regardless of input."""
+def test_max_tokens_passed_through():
+    """max_tokens should be forwarded to the API without capping."""
     captured_payload = {}
 
     class CapturingClient:
@@ -386,7 +386,7 @@ def test_max_tokens_capped_at_4096():
             return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
 
     _replay(client=CapturingClient(), max_tokens=16384)
-    assert captured_payload["max_tokens"] == 4096
+    assert captured_payload["max_tokens"] == 16384
 
 
 # ---------------------------------------------------------------------------

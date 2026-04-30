@@ -95,6 +95,7 @@ class RequestMetrics:
 
     itl_ms: list[float] = field(default_factory=list)
 
+
     # Thinking/reasoning token metrics (DeepSeek R1, o3, Claude extended thinking)
     thinking_tokens: int = 0
     ttft_thinking_ms: float = 0.0

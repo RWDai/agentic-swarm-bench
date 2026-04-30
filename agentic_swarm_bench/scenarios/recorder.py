@@ -36,7 +36,7 @@ except ImportError:
 
 from agentic_swarm_bench.proxy.utils import _detect_upstream_api
 
-_UPSTREAM_SUFFIXES = ("/v1/chat/completions", "/v1/messages")
+_UPSTREAM_SUFFIXES = ("/v1/chat/completions", "/v1/messages", "/v1/responses")
 
 
 def _normalize_recorder_upstream(url: str) -> str:
@@ -119,6 +119,44 @@ def create_recording_app(
             "upstream_api": "anthropic" if is_anthropic_upstream else "openai",
         }
 
+    def _responses_input_to_oai_messages(body: dict) -> list[dict]:
+        """Convert Responses API `input` to OpenAI chat messages for recording."""
+        raw_input = body.get("input", "")
+        instructions = body.get("instructions")
+        messages: list[dict] = []
+
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+
+        if isinstance(raw_input, str):
+            messages.append({"role": "user", "content": raw_input})
+            return messages
+
+        if not isinstance(raw_input, list):
+            return messages
+
+        for item in raw_input:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role", "user")
+            content = item.get("content", "")
+            if isinstance(content, str):
+                messages.append({"role": role, "content": content})
+            elif isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        text_parts.append(
+                            part.get("text", "")
+                            or part.get("refusal", "")
+                        )
+                messages.append({"role": role, "content": " ".join(text_parts).strip()})
+
+        return messages
+
     @app.api_route(
         "/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
@@ -128,6 +166,7 @@ def create_recording_app(
         body_json = None
         is_chat_completion = "chat/completions" in path
         is_messages_api = path.rstrip("/") in ("v1/messages",)
+        is_responses_api = path.rstrip("/").endswith("responses") and not is_chat_completion
         is_streaming = False
 
         try:
@@ -136,11 +175,14 @@ def create_recording_app(
         except Exception:
             pass
 
-        if not is_chat_completion and not is_messages_api:
+        if not is_chat_completion and not is_messages_api and not is_responses_api:
             return await _passthrough(request, path, body)
 
         if body_json is None:
             return await _passthrough(request, path, body)
+
+        if is_responses_api:
+            return await _handle_responses_api(request, body_json, is_streaming, path)
 
         # Anthropic passthrough: forward native Anthropic requests to Anthropic
         if is_messages_api and is_anthropic_upstream:
@@ -217,6 +259,168 @@ def create_recording_app(
                 if k.lower() not in ("content-length", "content-encoding", "transfer-encoding")
             },
         )
+
+    async def _handle_responses_api(
+        request: Request, body_json: dict, is_streaming: bool, path: str
+    ):
+        """Forward OpenAI Responses API requests, record as OpenAI messages for replay."""
+        state["seq"] += 1
+        seq = state["seq"]
+        t_start = time.perf_counter()
+
+        target_url = _resolve_upstream(path)
+        headers = _upstream_headers()
+
+        oai_messages = _responses_input_to_oai_messages(body_json)
+
+        entry = {
+            "seq": seq,
+            "experiment_id": state["experiment_id"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "messages": oai_messages,
+            "model": body_json.get("model", model),
+            "max_tokens": body_json.get("max_output_tokens", 4096),
+            "temperature": body_json.get("temperature", 1.0),
+            "stream": is_streaming,
+            "source_api": "responses",
+        }
+
+        if is_streaming:
+            return await _handle_responses_streaming(entry, body_json, target_url, headers, t_start)
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            resp = await client.post(target_url, json=body_json, headers=headers)
+
+        t_end = time.perf_counter()
+        entry["total_time_s"] = round(t_end - t_start, 3)
+        entry["status_code"] = resp.status_code
+
+        if resp.status_code == 200:
+            resp_json = resp.json()
+            usage = resp_json.get("usage", {})
+            entry["prompt_tokens"] = usage.get("input_tokens", 0)
+            entry["completion_tokens"] = usage.get("output_tokens", 0)
+            output_items = resp_json.get("output", [])
+            text_parts = []
+            for item in output_items:
+                if item.get("type") == "message":
+                    for block in item.get("content", []):
+                        if block.get("type") == "output_text":
+                            text_parts.append(block.get("text", ""))
+            entry["response_length"] = len("".join(text_parts))
+
+        _write_entry(entry)
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers={
+                k: v
+                for k, v in resp.headers.items()
+                if k.lower() not in ("content-length", "content-encoding", "transfer-encoding")
+            },
+        )
+
+    async def _handle_responses_streaming(
+        entry: dict, body_json: dict, target_url: str, headers: dict, t_start: float
+    ):
+        """Stream Responses API, pass through to client, record metrics."""
+
+        async def _stream():
+            ttft = None
+            ttft_visible = None
+            token_count = 0
+            first_time = None
+            last_time = None
+            response_chunks: list[str] = []
+            thinking_chunks: list[str] = []
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+                async with client.stream(
+                    "POST", target_url, json=body_json, headers=headers
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        yield body
+                        entry["status_code"] = resp.status_code
+                        entry["error"] = body.decode(errors="replace")[:500]
+                        entry["total_time_s"] = round(time.perf_counter() - t_start, 3)
+                        _write_entry(entry)
+                        return
+
+                    buf = b""
+                    async for chunk_bytes in resp.aiter_bytes():
+                        yield chunk_bytes
+
+                        buf += chunk_bytes
+                        while b"\n" in buf:
+                            raw_line, buf = buf.split(b"\n", 1)
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                continue
+                            try:
+                                data_obj = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+
+                            now = time.perf_counter()
+                            event_type = data_obj.get("type", "")
+
+                            if event_type == "response.output_text.delta":
+                                delta_text = data_obj.get("delta", "")
+                                if delta_text:
+                                    response_chunks.append(delta_text)
+                                    if first_time is None:
+                                        first_time = now
+                                        ttft = (now - t_start) * 1000
+                                    if ttft_visible is None:
+                                        ttft_visible = (now - t_start) * 1000
+                                    last_time = now
+                                    token_count += 1
+
+                            elif event_type == "response.reasoning_summary_text.delta":
+                                delta_text = data_obj.get("delta", "")
+                                if delta_text:
+                                    thinking_chunks.append(delta_text)
+                                    if first_time is None:
+                                        first_time = now
+                                        ttft = (now - t_start) * 1000
+                                    last_time = now
+                                    token_count += 1
+
+                            elif event_type == "response.completed":
+                                resp_obj = data_obj.get("response", {})
+                                usage = resp_obj.get("usage", {})
+                                if usage.get("input_tokens"):
+                                    entry["prompt_tokens"] = usage["input_tokens"]
+                                if usage.get("output_tokens"):
+                                    token_count = usage["output_tokens"]
+
+            t_end = time.perf_counter()
+            entry["ttft_ms"] = round(ttft, 2) if ttft else None
+            entry["total_time_s"] = round(t_end - t_start, 3)
+            entry["completion_tokens"] = token_count
+            entry["status_code"] = 200
+
+            if ttft_visible is not None:
+                entry["ttft_visible_ms"] = round(ttft_visible, 2)
+            if thinking_chunks:
+                entry["thinking_content"] = "".join(thinking_chunks)
+            if response_chunks:
+                entry["response_text"] = "".join(response_chunks)
+
+            if first_time and last_time and token_count > 1:
+                decode_time = last_time - first_time
+                entry["decode_time_s"] = round(decode_time, 3)
+                entry["tok_per_sec"] = round(token_count / decode_time, 2) if decode_time > 0 else 0
+
+
+            _write_entry(entry)
+
+        return StreamingResponse(_stream(), media_type="text/event-stream")
 
     _ANTHROPIC_FORWARD_HEADERS = {
         "anthropic-version",
@@ -385,6 +589,7 @@ def create_recording_app(
                 decode_time = last_time - first_time
                 entry["decode_time_s"] = round(decode_time, 3)
                 entry["tok_per_sec"] = round(token_count / decode_time, 2) if decode_time > 0 else 0
+
 
             _write_entry(entry)
 
@@ -555,6 +760,7 @@ def create_recording_app(
                 decode_time = last_time - first_time
                 entry["decode_time_s"] = round(decode_time, 3)
                 entry["tok_per_sec"] = round(token_count / decode_time, 2) if decode_time > 0 else 0
+
 
             _write_entry(entry)
 

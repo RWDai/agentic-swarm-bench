@@ -242,12 +242,11 @@ async def _replay_one_request(
             thinking_chunks=thinking_chunks,
         )
 
-    capped_tokens = min(max_tokens, 4096)
     token_limit_key = "max_completion_tokens" if "api.openai.com" in url else "max_tokens"
     payload = {
         "model": model,
         "messages": messages,
-        token_limit_key: capped_tokens,
+        token_limit_key: max_tokens,
         "temperature": 0.7,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -500,11 +499,10 @@ async def _replay_one_request_anthropic(
     if not conversation:
         conversation.append({"role": "user", "content": ""})
 
-    capped_tokens = min(max_tokens, 4096)
     payload: dict = {
         "model": model,
         "messages": conversation,
-        "max_tokens": capped_tokens,
+        "max_tokens": max_tokens,
         "stream": True,
     }
     if system_parts:

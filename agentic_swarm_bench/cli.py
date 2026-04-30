@@ -22,6 +22,8 @@ _POLICY_CHOICES = ["round_robin", "sequential"]
 if _HAS_SCHEDULER:
     _POLICY_CHOICES += ["random", "interleaved_random"]
 
+_AGENT_CMD_HELP = "Agent CLI command (default: claude)"
+
 
 class DefaultGroup(click.Group):
     """Click Group that dispatches to a default subcommand when none is recognised.
@@ -424,7 +426,7 @@ def eval(ctx, endpoint, model, api_key, api_key_header, tasks, validate, context
     help="Header name for the API key",
 )
 @click.option("--tasks", "-t", default="p1-p10", help="Task range")
-@click.option("--agent-cmd", default="claude", help="Agent CLI command (default: claude)")
+@click.option("--agent-cmd", default="claude", help=_AGENT_CMD_HELP)
 @click.option("--proxy-port", type=int, default=19000, help="Proxy listen port")
 @click.option("--output", "-o", default=None, help="Save results to file")
 @click.option(
@@ -1117,6 +1119,8 @@ def compare(baseline, candidate, output):
         console.print(f"Comparison saved to {output}")
     else:
         console.print(text)
+
+
 
 
 if __name__ == "__main__":

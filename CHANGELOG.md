@@ -2,6 +2,16 @@
 
 All notable changes to AgenticSwarmBench are documented here.
 
+## [4.0.4] - 2026-04-30
+
+### Fixed
+
+- **`max_tokens` silently capped at 4096.** Replay now passes the configured
+  `max_tokens` value through to the API unchanged, allowing models with larger
+  completion windows to use their full capacity.
+
+---
+
 ## [4.0.3] - 2026-04-22
 
 ### Added
