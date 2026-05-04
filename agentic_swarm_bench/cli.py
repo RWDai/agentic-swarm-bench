@@ -728,6 +728,13 @@ def record(ctx, endpoint, model, api_key, api_key_header, port, output, upstream
     "(api.anthropic.com → anthropic, everything else → openai).",
 )
 @click.option(
+    "--anthropic-beta",
+    default=None,
+    help="Comma-separated Anthropic beta feature flags sent as the anthropic-beta header. "
+    "Required for features like extended thinking "
+    "(e.g. 'prompt-caching-2024-07-31,extended-thinking-2025-04-14').",
+)
+@click.option(
     "--timeout",
     type=click.FloatRange(min=0.1),
     default=300.0,
@@ -865,6 +872,7 @@ def replay(
     output,
     json_stdout,
     upstream_api,
+    anthropic_beta,
     timeout,
     slice_tokens,
     dry_run,
@@ -932,7 +940,8 @@ def replay(
       asb replay -e URL -m MODEL -w js-coding-opus
       asb replay -e https://api.anthropic.com -m claude-sonnet-4-20250514 \\
         -w scenario.json --upstream-api anthropic -k $ANTHROPIC_API_KEY \\
-        --api-key-header x-api-key
+        --api-key-header x-api-key \\
+        --anthropic-beta prompt-caching-2024-07-31,extended-thinking-2025-04-14
     """
     if verbose and verbose_text:
         raise click.UsageError("--verbose and --verbose-text are mutually exclusive")
@@ -982,6 +991,7 @@ def replay(
                 max_consecutive_failures=max_consecutive_failures,
                 evaluate_llm=evaluate_llm,
                 upstream_api=upstream_api,
+                anthropic_beta=anthropic_beta,
             )
         )
     except FileNotFoundError as e:

@@ -2,6 +2,29 @@
 
 All notable changes to AgenticSwarmBench are documented here.
 
+## [4.0.5] - 2026-05-04
+
+### Fixed
+
+- **Anthropic replay temperature mismatch.** The Anthropic replay path was
+  missing the `temperature` field in its payload, causing the API to use its
+  default (1.0) while the OpenAI path always sent 0.7. Both paths now use the
+  same temperature for consistent benchmark results.
+
+- **Tool-use timing wrong on Anthropic replay.** `input_json_delta` events
+  (tool call arguments) were silently dropped by the Anthropic SSE parser,
+  causing TTFT and inter-token latency to be incorrect when the first output
+  was a tool call. These deltas are now tracked for timing metrics.
+
+### Added
+
+- **`--anthropic-beta` flag for replay.** Sends the `anthropic-beta` HTTP
+  header during Anthropic replay, enabling features like extended thinking
+  and prompt caching (e.g. `--anthropic-beta
+  prompt-caching-2024-07-31,extended-thinking-2025-04-14`).
+
+---
+
 ## [4.0.4] - 2026-04-30
 
 ### Fixed

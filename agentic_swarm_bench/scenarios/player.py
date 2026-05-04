@@ -135,10 +135,16 @@ class FailureTracker:
         return "ABORT: consecutive failure threshold exceeded"
 
 
-def _build_headers(config: BenchmarkConfig, upstream_api: str = "openai") -> dict:
+def _build_headers(
+    config: BenchmarkConfig,
+    upstream_api: str = "openai",
+    anthropic_beta: str | None = None,
+) -> dict:
     headers = {"Content-Type": "application/json"}
     if upstream_api == "anthropic":
         headers["anthropic-version"] = "2023-06-01"
+        if anthropic_beta:
+            headers["anthropic-beta"] = anthropic_beta
         if config.api_key:
             if config.api_key_header.lower() == "authorization":
                 headers["x-api-key"] = config.api_key
@@ -503,6 +509,7 @@ async def _replay_one_request_anthropic(
         "model": model,
         "messages": conversation,
         "max_tokens": max_tokens,
+        "temperature": 0.7,
         "stream": True,
     }
     if system_parts:
@@ -542,15 +549,18 @@ async def _replay_one_request_anthropic(
             delta = data_obj.get("delta", {})
             text = None
             is_thinking = False
-            if delta.get("type") == "text_delta":
+            delta_type = delta.get("type", "")
+            if delta_type == "text_delta":
                 text = delta.get("text")
                 if text and response_chunks is not None:
                     response_chunks.append(text)
-            elif delta.get("type") == "thinking_delta":
+            elif delta_type == "thinking_delta":
                 text = delta.get("thinking")
                 is_thinking = True
                 if text and thinking_chunks is not None:
                     thinking_chunks.append(text)
+            elif delta_type == "input_json_delta" and delta.get("partial_json"):
+                text = delta["partial_json"]
             if text:
                 now = time.perf_counter()
                 chunk_tokens = _estimate_tokens(text)
@@ -964,6 +974,7 @@ async def replay_scenario(
     max_consecutive_failures: int | None = None,
     evaluate_llm: bool = False,
     upstream_api: str | None = None,
+    anthropic_beta: str | None = None,
 ) -> BenchmarkRun:
     """Replay a recorded scenario against the configured endpoint.
 
@@ -1024,7 +1035,8 @@ async def replay_scenario(
         url = config.endpoint.rstrip("/")
     else:
         url = resolve_endpoint(config.endpoint)
-    headers = _build_headers(config, upstream_api=effective_api)
+    headers = _build_headers(config, upstream_api=effective_api, anthropic_beta=anthropic_beta)
+
 
     sliced_tasks = _apply_slice_to_tasks(scenario.tasks, slice_tokens)
     raw_queue = build_execution_queue(sliced_tasks, schedule)
