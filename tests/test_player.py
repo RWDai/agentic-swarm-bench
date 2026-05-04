@@ -991,3 +991,133 @@ class TestAnthropicMessageDeltaUsage:
         ]
         m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
         assert m.prompt_tokens == 175  # 50 + 100 + 25
+
+
+# ---------------------------------------------------------------------------
+# Anthropic decode_time_s / tok_per_sec timing parity
+# ---------------------------------------------------------------------------
+
+
+class DelayedAnthropicStreamResponse(FakeAnthropicStreamResponse):
+    """Yields events with configurable delays between groups.
+
+    *delay_before_index* inserts *delay_seconds* before yielding the event
+    at that index, simulating network latency for trailing protocol events.
+    """
+
+    def __init__(
+        self,
+        events: list[bytes],
+        delay_before_index: int,
+        delay_seconds: float,
+        **kwargs,
+    ):
+        super().__init__(events, **kwargs)
+        self._delay_idx = delay_before_index
+        self._delay_s = delay_seconds
+
+    async def aiter_bytes(self):
+        for i, event in enumerate(self._events):
+            if i == self._delay_idx:
+                await asyncio.sleep(self._delay_s)
+            yield event
+
+
+class TestDecodeTimingParity:
+    """decode_time_s should measure first→last content token, not stream close."""
+
+    def test_trailing_events_excluded_from_decode_time(self):
+        """Anthropic trailing events (message_delta, message_stop) must not
+        inflate decode_time_s.  We insert a 200ms delay before message_delta
+        and assert that decode_time_s is well under that."""
+        events = [
+            _anthropic_message_start(input_tokens=10),
+            _anthropic_text_delta("Hello "),
+            _anthropic_text_delta("world "),
+            _anthropic_text_delta("test "),
+            _anthropic_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _anthropic_message_delta(output_tokens=3),
+            _anthropic_event("message_stop", {"type": "message_stop"}),
+        ]
+        delay_idx = 4  # delay before content_block_stop
+        resp = DelayedAnthropicStreamResponse(events, delay_idx, 0.2)
+        m = _replay_anthropic(client=FakeAnthropicClient(resp))
+
+        assert m.error is None
+        assert m.completion_tokens == 3
+        assert m.decode_time_s is not None
+        assert m.decode_time_s < 0.15, (
+            f"decode_time_s={m.decode_time_s:.3f}s includes trailing overhead; "
+            "should measure first→last content token only"
+        )
+
+    def test_single_token_falls_back_to_end(self):
+        """With only one content chunk, last_token_time == first_token_time.
+        decode_time_s should still be a small positive value (falls back to end)."""
+        events = [
+            _anthropic_message_start(input_tokens=5),
+            _anthropic_text_delta("hi"),
+            _anthropic_message_delta(output_tokens=1),
+        ]
+        m = _replay_anthropic(client=FakeAnthropicClient(FakeAnthropicStreamResponse(events)))
+        assert m.error is None
+        assert m.completion_tokens == 1
+        assert m.decode_time_s is not None
+        assert m.decode_time_s > 0
+
+    def test_tok_per_sec_uses_content_window(self):
+        """tok_per_sec should reflect tokens / (last_content - first_content),
+        not tokens / (stream_close - first_content)."""
+        events = [
+            _anthropic_message_start(input_tokens=10),
+            _anthropic_text_delta("a " * 50),
+            _anthropic_text_delta("b " * 50),
+            _anthropic_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _anthropic_message_delta(output_tokens=100),
+            _anthropic_event("message_stop", {"type": "message_stop"}),
+        ]
+        delay_idx = 3  # delay before content_block_stop
+        resp = DelayedAnthropicStreamResponse(events, delay_idx, 0.3)
+        m = _replay_anthropic(client=FakeAnthropicClient(resp))
+
+        assert m.error is None
+        assert m.tok_per_sec is not None
+        assert m.tok_per_sec > 100, (
+            f"tok_per_sec={m.tok_per_sec:.1f} is too low; "
+            "trailing delay is leaking into decode_time_s"
+        )
+
+
+class DelayedOAIStreamResponse(FakeStreamResponse):
+    """FakeStreamResponse that sleeps before a specific line index."""
+
+    def __init__(self, lines: list[str], delay_before_index: int, delay_seconds: float, **kwargs):
+        super().__init__(lines, **kwargs)
+        self._delay_idx = delay_before_index
+        self._delay_s = delay_seconds
+
+    async def aiter_lines(self):
+        for i, line in enumerate(self.lines):
+            if i == self._delay_idx:
+                await asyncio.sleep(self._delay_s)
+            yield line
+
+
+class TestOAIDecodeTimingParity:
+    """OpenAI decode_time_s should also exclude trailing usage/DONE overhead."""
+
+    def test_usage_line_delay_excluded_from_decode_time(self):
+        """A 200ms gap between last content and usage/DONE should not inflate TPS."""
+        content_lines = _make_sse_lines(
+            [_sse_chunk("hello "), _sse_chunk("world ")],
+            usage={"prompt_tokens": 10, "completion_tokens": 50},
+        )
+        delay_idx = len(content_lines) - 2  # usage line (just before [DONE])
+        resp = DelayedOAIStreamResponse(content_lines, delay_idx, 0.2)
+        m = _replay(client=FakeClient(resp))
+
+        assert m.error is None
+        assert m.decode_time_s is not None
+        assert m.decode_time_s < 0.15, (
+            f"decode_time_s={m.decode_time_s:.3f}s includes trailing overhead"
+        )

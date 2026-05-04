@@ -2,6 +2,20 @@
 
 All notable changes to AgenticSwarmBench are documented here.
 
+## [4.0.6] - 2026-05-04
+
+### Fixed
+
+- **`tok_per_sec` systematically lower on Anthropic replay.** `decode_time_s`
+  was measured from the first content token to stream close. The Anthropic
+  stream includes trailing protocol events (`content_block_stop`,
+  `message_delta`, `message_stop`) after the last content token, inflating
+  the denominator. Both OpenAI and Anthropic paths now measure
+  `decode_time_s` as first-content-token → last-content-token, producing
+  consistent throughput numbers when hitting the same backend.
+
+---
+
 ## [4.0.5] - 2026-05-04
 
 ### Fixed

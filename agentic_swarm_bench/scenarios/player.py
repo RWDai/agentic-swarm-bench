@@ -388,7 +388,8 @@ async def _replay_one_request(
 
     effective_tokens = metrics.completion_tokens
     if effective_tokens > 0 and first_token_time is not None:
-        metrics.decode_time_s = end - first_token_time
+        decode_end = last_token_time if last_token_time > first_token_time else end
+        metrics.decode_time_s = decode_end - first_token_time
         if metrics.decode_time_s > 0:
             metrics.tok_per_sec = effective_tokens / metrics.decode_time_s
 
@@ -648,7 +649,8 @@ async def _replay_one_request_anthropic(
     metrics.thinking_tokens = thinking_token_count
 
     if token_count > 0 and first_token_time is not None:
-        metrics.decode_time_s = end - first_token_time
+        decode_end = last_token_time if last_token_time > first_token_time else end
+        metrics.decode_time_s = decode_end - first_token_time
         if metrics.decode_time_s > 0:
             metrics.tok_per_sec = token_count / metrics.decode_time_s
 
