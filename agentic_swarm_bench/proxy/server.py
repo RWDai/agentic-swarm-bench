@@ -32,7 +32,7 @@ from agentic_swarm_bench.proxy.translators import (
     make_anthropic_stream_events,
     openai_to_anthropic_response,
 )
-from agentic_swarm_bench.proxy.utils import _detect_upstream_api
+from agentic_swarm_bench.proxy.utils import _detect_upstream_api, _strip_api_suffix
 
 
 def create_app(
@@ -179,7 +179,7 @@ def create_app(
         t_start: float, metrics_log_path: Path,
     ):
         """Forward Anthropic requests natively to an Anthropic upstream, capture metrics."""
-        target_url = upstream_url.rstrip("/") + "/v1/messages"
+        target_url = _strip_api_suffix(upstream_url) + "/v1/messages"
         headers = _upstream_headers()
         for h in _ANTHROPIC_FORWARD_HEADERS:
             val = request.headers.get(h)
@@ -330,7 +330,7 @@ async def _handle_messages(
             context_target_tokens,
         )
 
-    upstream = f"{upstream_url}/v1/chat/completions"
+    upstream = f"{_strip_api_suffix(upstream_url)}/v1/chat/completions"
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"

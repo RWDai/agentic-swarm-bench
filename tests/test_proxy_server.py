@@ -11,7 +11,11 @@ httpx = pytest.importorskip("httpx")
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 
-from agentic_swarm_bench.proxy.server import _detect_upstream_api, create_app  # noqa: E402
+from agentic_swarm_bench.proxy.server import (  # noqa: E402
+    _detect_upstream_api,
+    _strip_api_suffix,
+    create_app,
+)
 
 # ---------------------------------------------------------------------------
 # _detect_upstream_api (now from proxy.utils, re-exported via server)
@@ -37,6 +41,41 @@ def test_detect_anthropic_subdomain():
 def test_detect_openai_fallback():
     assert _detect_upstream_api("http://localhost:8000", None) == "openai"
     assert _detect_upstream_api("https://api.openai.com", None) == "openai"
+
+
+def test_detect_anthropic_by_path():
+    assert _detect_upstream_api("https://api.swarmone.ai/abc/v1/messages", None) == "anthropic"
+    assert _detect_upstream_api("https://example.com/v1/messages/", None) == "anthropic"
+
+
+def test_detect_openai_by_path():
+    assert _detect_upstream_api("https://example.com/v1/chat/completions", None) == "openai"
+
+
+# ---------------------------------------------------------------------------
+# _strip_api_suffix
+# ---------------------------------------------------------------------------
+
+
+def test_strip_suffix_chat_completions():
+    assert _strip_api_suffix("http://host/v1/chat/completions") == "http://host"
+
+
+def test_strip_suffix_messages():
+    assert _strip_api_suffix("https://api.swarmone.ai/abc/v1/messages") == "https://api.swarmone.ai/abc"
+
+
+def test_strip_suffix_responses():
+    assert _strip_api_suffix("http://host/v1/responses") == "http://host"
+
+
+def test_strip_suffix_trailing_slash():
+    assert _strip_api_suffix("http://host/v1/messages/") == "http://host"
+
+
+def test_strip_suffix_noop():
+    assert _strip_api_suffix("http://host:8000") == "http://host:8000"
+    assert _strip_api_suffix("http://host:8000/") == "http://host:8000"
 
 
 # ---------------------------------------------------------------------------

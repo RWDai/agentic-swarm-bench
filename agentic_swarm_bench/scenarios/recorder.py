@@ -34,25 +34,7 @@ except ImportError:
     HAS_FASTAPI = False
 
 
-from agentic_swarm_bench.proxy.utils import _detect_upstream_api
-
-_UPSTREAM_SUFFIXES = ("/v1/chat/completions", "/v1/messages", "/v1/responses")
-
-
-def _normalize_recorder_upstream(url: str) -> str:
-    """Strip a trailing API path from the configured upstream.
-
-    ``asb record`` accepts either a bare root (``https://host/prefix``) or a
-    full chat/completions URL (``https://host/prefix/v1/chat/completions``).
-    The agent sending requests to the recorder will include its own
-    ``/v1/chat/completions`` (or ``/v1/messages``) in the path, so any suffix
-    already on the upstream would be appended twice. Normalise to a bare root.
-    """
-    trimmed = url.rstrip("/")
-    for suffix in _UPSTREAM_SUFFIXES:
-        if trimmed.endswith(suffix):
-            return trimmed[: -len(suffix)]
-    return trimmed
+from agentic_swarm_bench.proxy.utils import _detect_upstream_api, _strip_api_suffix
 
 
 def create_recording_app(
@@ -75,7 +57,7 @@ def create_recording_app(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     is_anthropic_upstream = _detect_upstream_api(upstream_url, upstream_api) == "anthropic"
-    upstream_base = _normalize_recorder_upstream(upstream_url)
+    upstream_base = _strip_api_suffix(upstream_url)
 
     state = {
         "experiment_id": uuid.uuid4().hex[:12],
@@ -812,7 +794,7 @@ def run_recorder(
     _precheck_port(port)
 
     detected_api = _detect_upstream_api(upstream_url, upstream_api)
-    effective_upstream = _normalize_recorder_upstream(upstream_url)
+    effective_upstream = _strip_api_suffix(upstream_url)
 
     app = create_recording_app(
         upstream_url=upstream_url,

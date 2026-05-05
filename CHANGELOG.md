@@ -2,6 +2,25 @@
 
 All notable changes to AgenticSwarmBench are documented here.
 
+## [4.0.8] - 2026-05-05
+
+### Fixed
+
+- **Proxy URL double-pathing on non-root upstream endpoints.** When
+  `upstream_url` already contained an API suffix (e.g.
+  `https://host/prefix/v1/messages`), the proxy appended another
+  `/v1/chat/completions`, producing an invalid path like
+  `/v1/messages/v1/chat/completions`. Both the proxy server and recorder
+  now strip known API suffixes before building the upstream URL.
+
+- **Upstream API detection for proxied Anthropic endpoints.** Endpoints
+  like `https://proxy.example.com/abc/v1/messages` were misdetected as
+  OpenAI because detection only checked the hostname. The detector now
+  also inspects the URL path, so `/v1/messages` endpoints are correctly
+  identified as Anthropic regardless of host.
+
+---
+
 ## [4.0.6] - 2026-05-04
 
 ### Fixed
