@@ -80,10 +80,10 @@ asb replay -e http://your-server:8000 -m your-model --scenario trivial-qa
 This fires 5 trivial single-turn requests (~20 tokens each) and reports TTFT and tok/s. If numbers come back, your setup works. Then try the real thing:
 
 ```bash
-asb replay -e http://your-server:8000 -m your-model --scenario js-coding-opus
+asb replay -e http://your-server:8000 -m your-model --scenario cpp-builds-gemma-4-31b
 ```
 
-This replays 5 multi-turn agentic coding sessions (REST API, CLI tool, WebSocket chat, audit trail, search/batch) recorded with Claude Opus 4.6 - growing context from ~1K to ~40K chars across 4 turns each.
+This replays 3 real agentic C++ build sessions (Firefox, LLVM+Firefox, vLLM Docker) recorded with Gemma 4 31B - multi-turn conversations with growing context across real coding tasks.
 
 ### Record a real session, then replay it anywhere
 
@@ -161,12 +161,13 @@ docker run --rm -v $(pwd)/results:/results \
 
 ## Built-in Scenarios
 
-Two ready-made scenarios ship with the package so you can benchmark immediately - no recording needed:
+Ready-made scenarios ship with the package so you can benchmark immediately - no recording needed:
 
-| Scenario             | Type                  | Tasks | Turns/task | Context          | What it measures                                    |
-| -------------------- | --------------------- | ----: | ---------: | ---------------- | --------------------------------------------------- |
-| **`trivial-qa`**     | Non-agentic baseline  |     5 |          1 | ~20 tokens each  | Raw single-turn speed (TTFT, tok/s)                 |
-| **`js-coding-opus`** | Real agentic sessions |     5 |          4 | ~1K → ~40K chars | Multi-turn agentic performance with growing context |
+| Scenario                        | Type                  | Tasks | Requests | What it measures                                         |
+| ------------------------------- | --------------------- | ----: | -------: | -------------------------------------------------------- |
+| **`trivial-qa`**                | Non-agentic baseline  |     5 |        5 | Raw single-turn speed (TTFT, tok/s)                      |
+| **`cpp-builds-claude-opus-4.6`** | Real agentic sessions |     3 |      351 | Multi-turn agentic C++ builds with Claude Opus 4.6       |
+| **`cpp-builds-gemma-4-31b`**    | Real agentic sessions |     3 |       65 | Multi-turn agentic C++ builds with Gemma 4 31B           |
 
 ```bash
 # List all built-in scenarios
@@ -175,19 +176,21 @@ asb list-scenarios
 # Quick smoke test - 5 trivial questions, ~20 tokens each
 asb replay -e http://your-server:8000 -m your-model --scenario trivial-qa
 
-# Real agentic workload - 5 JS coding sessions recorded with Claude Opus 4.6
-asb replay -e http://your-server:8000 -m your-model --scenario js-coding-opus
+# Real agentic workload - C++ build sessions recorded with Gemma 4 31B
+asb replay -e http://your-server:8000 -m your-model --scenario cpp-builds-gemma-4-31b
 
 # Replay a single task from a scenario
-asb replay -e http://your-server:8000 -m your-model --scenario js-coding-opus --task build-rest-api
+asb replay -e http://your-server:8000 -m your-model --scenario cpp-builds-gemma-4-31b --task cpp-build-firefox
 
 # Run multiple repetitions for stable numbers
-asb replay -e http://your-server:8000 -m your-model --scenario js-coding-opus --repetitions 3
+asb replay -e http://your-server:8000 -m your-model --scenario cpp-builds-gemma-4-31b --repetitions 3
 ```
 
 **`trivial-qa`** - Five trivial single-turn questions (capital of France, largest planet, boiling point of water, speed of light, binary conversion). Non-agentic baseline with minimal context. Useful as a quick smoke test and for comparing agentic vs non-agentic performance on the same endpoint.
 
-**`js-coding-opus`** - Five independent JavaScript coding sessions (rate limiting middleware, CLI admin tool, WebSocket real-time updates, activity log/audit trail, search & batch operations). Each task has 4 turns of real multi-turn conversation with growing context. Recorded with Claude Opus 4.6 against a TaskFlow API project.
+**`cpp-builds-claude-opus-4.6`** - Three C++ build tasks (download and build Firefox, build LLVM then Firefox with custom Clang, Docker container running vLLM with 125M model). Real multi-turn agentic sessions recorded with Claude Opus 4.6 via Anthropic API.
+
+**`cpp-builds-gemma-4-31b`** - The same three C++ build tasks recorded with Gemma 4 31B via Together AI. Lighter than the Opus recording (~600K tokens vs ~12.7M tokens), making it a good starting point for benchmarking.
 
 ---
 
@@ -301,7 +304,7 @@ asb replay -e URL -m MODEL --scenario session.jsonl --slice-tokens 1000000
 **Early abort:** `--max-consecutive-failures N` stops the entire run if any worker slot hits N consecutive failures (HTTP errors, timeouts). Useful when pointing at an endpoint that may be down or producing garbage:
 
 ```bash
-asb replay -e URL -m MODEL --scenario js-coding-opus --max-consecutive-failures 5
+asb replay -e URL -m MODEL --scenario cpp-builds-gemma-4-31b --max-consecutive-failures 5
 ```
 
 
@@ -662,8 +665,9 @@ agentic-swarm-bench/
       schedule.py       ← Execution schedule: repetitions, concurrency, ordering policy
       poison.py         ← Prefix-cache poisoning hooks (uses pre-processed recordings)
       data/
-        trivial-qa/     ← Non-agentic baseline (5 single-turn Q&A tasks, with evaluations)
-        js-coding-opus/ ← Agentic JS coding sessions (5 multi-turn tasks)
+        trivial-qa/                ← Non-agentic baseline (5 single-turn Q&A tasks)
+        cpp-builds-claude-opus-4.6/ ← C++ build sessions with Claude Opus 4.6 (3 tasks)
+        cpp-builds-gemma-4-31b/    ← C++ build sessions with Gemma 4 31B (3 tasks)
 
     tasks/
       tasks.json        ← 110 agentic swarm tasks, P1-P110
