@@ -133,3 +133,90 @@ async def test_openai_chat_completions_records_entry(tmp_path):
     entry = json.loads(lines[0])
     assert entry["seq"] == 1
     assert len(entry["messages"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tools captured in JSONL entries
+# ---------------------------------------------------------------------------
+
+
+async def test_openai_chat_completions_records_tools(tmp_path):
+    output_file = tmp_path / "recording.jsonl"
+    app = create_recording_app(
+        upstream_url="http://fake-upstream:8000",
+        model="test",
+        output_file=str(output_file),
+    )
+
+    fake_response = {
+        "id": "cmpl-2",
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "bash", "description": "Run command", "parameters": {}},
+        }
+    ]
+
+    with respx.mock:
+        respx.post("http://fake-upstream:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=fake_response)
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            body = {
+                "model": "test",
+                "messages": [{"role": "user", "content": "list files"}],
+                "tools": tools,
+                "max_tokens": 50,
+                "stream": False,
+            }
+            resp = await client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200
+    lines = [ln for ln in output_file.read_text().strip().splitlines() if ln]
+    entry = json.loads(lines[0])
+    assert "tools" in entry
+    assert entry["tools"] is not None
+    assert len(entry["tools"]) == 1
+    assert entry["tools"][0]["function"]["name"] == "bash"
+
+
+async def test_openai_chat_completions_records_null_tools_when_absent(tmp_path):
+    output_file = tmp_path / "recording.jsonl"
+    app = create_recording_app(
+        upstream_url="http://fake-upstream:8000",
+        model="test",
+        output_file=str(output_file),
+    )
+
+    fake_response = {
+        "id": "cmpl-3",
+        "choices": [
+            {"message": {"role": "assistant", "content": "hello"}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+
+    with respx.mock:
+        respx.post("http://fake-upstream:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(200, json=fake_response)
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            body = {
+                "model": "test",
+                "messages": [{"role": "user", "content": "say hello"}],
+                "max_tokens": 50,
+                "stream": False,
+            }
+            resp = await client.post("/v1/chat/completions", json=body)
+
+    assert resp.status_code == 200
+    lines = [ln for ln in output_file.read_text().strip().splitlines() if ln]
+    entry = json.loads(lines[0])
+    assert "tools" in entry
+    assert entry["tools"] is None

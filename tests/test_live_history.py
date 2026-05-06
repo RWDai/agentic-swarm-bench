@@ -697,6 +697,14 @@ class TestMessageContentLen:
     def test_missing_content(self):
         assert _message_content_len({"role": "user"}) == 0
 
+    def test_none_content(self):
+        """tool_calls messages have content=None — must not crash."""
+        assert _message_content_len({"role": "assistant", "content": None}) == 0
+
+    def test_none_content_with_reasoning(self):
+        msg = {"role": "assistant", "content": None, "reasoning_content": "thinking"}
+        assert _message_content_len(msg) == 8
+
     def test_anthropic_blocks(self):
         msg = {
             "role": "assistant",

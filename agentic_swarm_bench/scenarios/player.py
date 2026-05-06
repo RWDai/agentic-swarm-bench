@@ -211,6 +211,7 @@ async def _replay_one_request(
     upstream_api: str = "openai",
     response_chunks: list[str] | None = None,
     thinking_chunks: list[str] | None = None,
+    tools: list[dict] | None = None,
 ) -> RequestMetrics:
     """Replay a single recorded request and collect timing metrics.
 
@@ -246,6 +247,7 @@ async def _replay_one_request(
             extra_body=extra_body,
             response_chunks=response_chunks,
             thinking_chunks=thinking_chunks,
+            tools=tools,
         )
 
     token_limit_key = "max_completion_tokens" if "api.openai.com" in url else "max_tokens"
@@ -257,6 +259,8 @@ async def _replay_one_request(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if tools:
+        payload["tools"] = tools
     if extra_body:
         payload.update(extra_body)
 
@@ -403,6 +407,21 @@ async def _replay_one_request(
     return metrics
 
 
+def _openai_tools_to_anthropic(tools: list[dict]) -> list[dict]:
+    """Convert OpenAI function-calling tools to Anthropic tool definitions."""
+    anthropic_tools = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+        fn = tool.get("function", {})
+        anthropic_tools.append({
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {}),
+        })
+    return anthropic_tools
+
+
 def _openai_msgs_to_anthropic(messages: list[dict]) -> tuple[list[str], list[dict]]:
     """Convert OpenAI-format messages to Anthropic conversation format.
 
@@ -489,6 +508,7 @@ async def _replay_one_request_anthropic(
     extra_body: dict | None = None,
     response_chunks: list[str] | None = None,
     thinking_chunks: list[str] | None = None,
+    tools: list[dict] | None = None,
 ) -> RequestMetrics:
     """Replay a single request via Anthropic Messages API.
 
@@ -515,6 +535,8 @@ async def _replay_one_request_anthropic(
     }
     if system_parts:
         payload["system"] = "\n".join(system_parts)
+    if tools:
+        payload["tools"] = _openai_tools_to_anthropic(tools)
     if extra_body:
         payload.update(extra_body)
 
@@ -868,6 +890,7 @@ async def _replay_task_entries(
             on_complete=on_complete,
             extra_body=extra_body,
             upstream_api=upstream_api,
+            tools=entry.tools,
         )
         m.context_profile = _bucket_label(tokens)
         m.context_tokens = tokens
@@ -936,6 +959,7 @@ async def _replay_task_entries_live(
             upstream_api=upstream_api,
             response_chunks=response_chunks,
             thinking_chunks=thinking_chunks,
+            tools=entry.tools,
         )
 
         response_text = "".join(response_chunks)
@@ -1340,6 +1364,7 @@ async def _run_verbose(
                     upstream_api=upstream_api,
                     response_chunks=response_chunks,
                     thinking_chunks=thinking_chunks,
+                    tools=entry.tools,
                 )
 
                 response_text = ""
@@ -1662,6 +1687,7 @@ async def _run_verbose_text(
                     upstream_api=upstream_api,
                     response_chunks=response_chunks,
                     thinking_chunks=thinking_chunks,
+                    tools=entry.tools,
                 )
 
                 response_text = "".join(response_chunks)

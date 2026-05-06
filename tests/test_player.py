@@ -1121,3 +1121,205 @@ class TestOAIDecodeTimingParity:
         assert m.decode_time_s < 0.15, (
             f"decode_time_s={m.decode_time_s:.3f}s includes trailing overhead"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tools injection in replay payload
+# ---------------------------------------------------------------------------
+
+
+_SAMPLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "editor",
+            "description": "Edit a file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+]
+
+
+class TestToolsInPayload:
+    """Tools from the recording must be included in the replay payload."""
+
+    def test_openai_payload_includes_tools(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        _replay(client=CapturingClient(), tools=_SAMPLE_TOOLS)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 2
+        assert captured_payload["tools"][0]["function"]["name"] == "bash"
+
+    def test_openai_payload_omits_tools_when_none(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        _replay(client=CapturingClient(), tools=None)
+        assert "tools" not in captured_payload
+
+    def test_anthropic_payload_includes_tools_converted(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay_anthropic(client=CapturingClient(), tools=_SAMPLE_TOOLS)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 2
+        assert captured_payload["tools"][0]["name"] == "bash"
+        assert "input_schema" in captured_payload["tools"][0]
+
+    def test_anthropic_payload_omits_tools_when_none(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay_anthropic(client=CapturingClient(), tools=None)
+        assert "tools" not in captured_payload
+
+
+class TestOpenaiToolsToAnthropic:
+    """_openai_tools_to_anthropic converts OAI function tools to Anthropic format."""
+
+    def test_converts_function_tools(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        result = _openai_tools_to_anthropic(_SAMPLE_TOOLS)
+        assert len(result) == 2
+        assert result[0]["name"] == "bash"
+        assert result[0]["description"] == "Run a shell command"
+        assert result[0]["input_schema"]["type"] == "object"
+
+    def test_skips_non_function_tools(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        tools = [
+            {"type": "web_search"},
+            {"type": "function", "function": {"name": "bash", "parameters": {}}},
+        ]
+        result = _openai_tools_to_anthropic(tools)
+        assert len(result) == 1
+        assert result[0]["name"] == "bash"
+
+    def test_empty_tools(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        assert _openai_tools_to_anthropic([]) == []
+
+    def test_missing_description_and_parameters(self):
+        from agentic_swarm_bench.scenarios.player import _openai_tools_to_anthropic
+
+        tools = [{"type": "function", "function": {"name": "bare_tool"}}]
+        result = _openai_tools_to_anthropic(tools)
+        assert len(result) == 1
+        assert result[0]["name"] == "bare_tool"
+        assert result[0]["description"] == ""
+        assert result[0]["input_schema"] == {}
+
+
+class TestToolsEdgeCases:
+    """Edge cases around empty or degenerate tools lists."""
+
+    def test_empty_tools_list_omitted_from_openai_payload(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        _replay(client=CapturingClient(), tools=[])
+        assert "tools" not in captured_payload
+
+    def test_empty_tools_list_omitted_from_anthropic_payload(self):
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        _replay_anthropic(client=CapturingClient(), tools=[])
+        assert "tools" not in captured_payload
+
+    def test_tools_with_non_function_types_openai(self):
+        """Non-function tools (e.g. web_search) pass through in OAI payload."""
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeStreamResponse(_make_sse_lines([_sse_chunk(content="ok")]))
+
+        tools = [
+            {"type": "web_search"},
+            {"type": "function", "function": {"name": "bash", "parameters": {}}},
+        ]
+        _replay(client=CapturingClient(), tools=tools)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 2
+
+    def test_tools_with_non_function_types_anthropic_filters(self):
+        """Non-function tools should be filtered out in the Anthropic conversion."""
+        captured_payload = {}
+
+        class CapturingClient:
+            def stream(self, method, url, json=None, **kwargs):
+                captured_payload.update(json or {})
+                return FakeAnthropicStreamResponse([
+                    _anthropic_message_start(),
+                    _anthropic_text_delta("ok"),
+                    _anthropic_message_delta(output_tokens=1),
+                ])
+
+        tools = [
+            {"type": "web_search"},
+            {"type": "function", "function": {"name": "bash", "parameters": {}}},
+        ]
+        _replay_anthropic(client=CapturingClient(), tools=tools)
+        assert "tools" in captured_payload
+        assert len(captured_payload["tools"]) == 1
+        assert captured_payload["tools"][0]["name"] == "bash"

@@ -32,6 +32,7 @@ class RecordingEntry:
     experiment_id: str = ""
     timestamp: str = ""
     messages: list[dict] = field(default_factory=list)
+    tools: list[dict] | None = None
     model: str = ""
     max_tokens: int = 4096
     temperature: float = 1.0
@@ -143,6 +144,7 @@ def _parse_entry(data: dict) -> RecordingEntry:
         experiment_id=data.get("experiment_id", ""),
         timestamp=data.get("timestamp", ""),
         messages=data.get("messages") or [],
+        tools=data.get("tools"),
         model=data.get("model", ""),
         max_tokens=data.get("max_tokens", 4096),
         temperature=data.get("temperature", 1.0),

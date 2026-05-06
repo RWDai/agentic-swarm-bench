@@ -2,6 +2,33 @@
 
 All notable changes to AgenticSwarmBench are documented here.
 
+## [4.0.9] - 2026-05-06
+
+### Fixed
+
+- **Tools never captured in scenario recordings.** The recorder wrote
+  `tools: null` for every JSONL entry, even when the original request
+  included tool definitions. Models replayed from these recordings
+  generated prose instead of calling tools. All three recording paths
+  (OpenAI, Anthropic passthrough, Responses API) now capture the
+  `tools` array from the request body.
+
+- **Tools not injected during replay.** The player never sent tool
+  definitions in the replay payload, so models had no tools available.
+  `_replay_one_request` and `_replay_one_request_anthropic` now accept
+  and forward a `tools` parameter. For Anthropic replay, OpenAI-format
+  function tools are converted to Anthropic's `input_schema` format.
+  All replay modes (recorded, live, verbose, verbose-text, interleaved)
+  thread `entry.tools` through to the request.
+
+- **Cache-defeat crash on `content: null` messages.** `_serialize_messages`
+  and `_reconstruct_messages` in the BPE-aware poisoning module crashed
+  with `TypeError` when encountering tool_calls messages (`content: null`).
+  Both functions now treat `None` content as empty string for serialization
+  while preserving the original `null` in the reconstructed output.
+
+---
+
 ## [4.0.8] - 2026-05-05
 
 ### Fixed

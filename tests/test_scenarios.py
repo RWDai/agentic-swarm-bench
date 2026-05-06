@@ -910,3 +910,164 @@ def test_total_tokens_approx_with_content_null():
     )
     task = Task(id="t", entries=[entry])
     assert task.total_tokens_approx == 0
+
+
+# ---------------------------------------------------------------------------
+# Tools field on RecordingEntry
+# ---------------------------------------------------------------------------
+
+
+def test_recording_entry_tools_default_none():
+    entry = RecordingEntry()
+    assert entry.tools is None
+
+
+def test_parse_entry_tools_present():
+    from agentic_swarm_bench.scenarios.registry import _parse_entry
+
+    tools = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
+    entry = _parse_entry({"seq": 1, "messages": [], "tools": tools})
+    assert entry.tools == tools
+    assert len(entry.tools) == 1
+    assert entry.tools[0]["function"]["name"] == "bash"
+
+
+def test_parse_entry_tools_absent():
+    from agentic_swarm_bench.scenarios.registry import _parse_entry
+
+    entry = _parse_entry({"seq": 1, "messages": []})
+    assert entry.tools is None
+
+
+def test_parse_entry_tools_null():
+    from agentic_swarm_bench.scenarios.registry import _parse_entry
+
+    entry = _parse_entry({"seq": 1, "messages": [], "tools": None})
+    assert entry.tools is None
+
+
+def test_load_jsonl_with_tools(tmp_path):
+    from agentic_swarm_bench.scenarios.registry import _load_jsonl
+
+    tools = [{"type": "function", "function": {"name": "editor", "parameters": {}}}]
+    jsonl = tmp_path / "with_tools.jsonl"
+    jsonl.write_text(json.dumps({"seq": 1, "messages": [], "tools": tools}) + "\n")
+    entries = _load_jsonl(jsonl)
+    assert len(entries) == 1
+    assert entries[0].tools == tools
+
+
+def test_load_jsonl_without_tools_field(tmp_path):
+    from agentic_swarm_bench.scenarios.registry import _load_jsonl
+
+    jsonl = tmp_path / "no_tools.jsonl"
+    jsonl.write_text(json.dumps({"seq": 1, "messages": []}) + "\n")
+    entries = _load_jsonl(jsonl)
+    assert len(entries) == 1
+    assert entries[0].tools is None
+
+
+# ---------------------------------------------------------------------------
+# _flatten_message_text handles content=None (tool_calls messages)
+# ---------------------------------------------------------------------------
+
+
+def test_flatten_message_text_content_none():
+    """_flatten_message_text must not crash when content is None."""
+    from agentic_swarm_bench.scenarios.poison import _flatten_message_text
+
+    messages = [
+        {"role": "user", "content": "build it"},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "content": "ok", "tool_call_id": "t1"},
+    ]
+    result = _flatten_message_text(messages)
+    assert result == "build itok"
+
+
+def test_flatten_message_text_all_none():
+    """All content=None messages should produce an empty string."""
+    from agentic_swarm_bench.scenarios.poison import _flatten_message_text
+
+    messages = [
+        {"role": "assistant", "content": None},
+        {"role": "assistant", "content": None},
+    ]
+    assert _flatten_message_text(messages) == ""
+
+
+# ---------------------------------------------------------------------------
+# OSS poison fallback with content=None messages
+# ---------------------------------------------------------------------------
+
+
+def test_poison_fallback_content_none_no_crash():
+    """The private fallback poison path must not crash on content=None."""
+    from agentic_swarm_bench.scenarios.poison import poison_task_execution
+    from agentic_swarm_bench.scenarios.registry import RecordingEntry, Task
+
+    entries = [
+        RecordingEntry(
+            seq=1,
+            messages=[
+                {"role": "user", "content": "build the project"},
+                {"role": "assistant", "content": None, "tool_calls": [{"id": "t1"}]},
+                {"role": "tool", "content": "success", "tool_call_id": "t1"},
+                {"role": "user", "content": "run the tests now"},
+            ],
+        ),
+    ]
+    task = Task(id="test-task", name="test", entries=entries)
+    poisoned = poison_task_execution(task, lcp_len=0, execution_index=0)
+    for msg in poisoned.entries[0].messages:
+        if msg.get("tool_calls"):
+            assert msg["content"] is None
+
+
+def test_poison_fallback_preserves_tools():
+    """The private fallback poison path must preserve tools on entries."""
+    from agentic_swarm_bench.scenarios.poison import poison_task_execution
+    from agentic_swarm_bench.scenarios.registry import RecordingEntry, Task
+
+    tools = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
+    entries = [
+        RecordingEntry(
+            seq=1,
+            messages=[{"role": "user", "content": "hello world"}],
+            tools=tools,
+        ),
+    ]
+    task = Task(id="test-task", name="test", entries=entries)
+    poisoned = poison_task_execution(task, lcp_len=0, execution_index=0)
+    assert poisoned.entries[0].tools == tools
+
+
+# ---------------------------------------------------------------------------
+# Tools field with tool_calls messages round-trip through JSONL
+# ---------------------------------------------------------------------------
+
+
+def test_load_jsonl_tools_with_tool_calls_messages(tmp_path):
+    """Full round-trip: JSONL with tools AND tool_calls messages parses correctly."""
+    from agentic_swarm_bench.scenarios.registry import _load_jsonl
+
+    tools = [{"type": "function", "function": {"name": "bash", "parameters": {}}}]
+    data = {
+        "seq": 1,
+        "messages": [
+            {"role": "user", "content": "build it"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "t1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "content": "ok", "tool_call_id": "t1"},
+        ],
+        "tools": tools,
+    }
+    jsonl = tmp_path / "toolcalls.jsonl"
+    jsonl.write_text(json.dumps(data) + "\n")
+    entries = _load_jsonl(jsonl)
+
+    assert len(entries) == 1
+    assert entries[0].tools == tools
+    assert entries[0].messages[1]["content"] is None
+    assert entries[0].messages[1]["tool_calls"][0]["function"]["name"] == "bash"

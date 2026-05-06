@@ -84,12 +84,15 @@ def create_recording_app(
         with open(out_path, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
-    def _anthropic_messages_to_openai(body: dict) -> list[dict]:
-        """Convert Anthropic message format to OpenAI for the JSONL recording."""
+    def _anthropic_messages_to_openai(body: dict) -> tuple[list[dict], list[dict] | None]:
+        """Convert Anthropic message format to OpenAI for the JSONL recording.
+
+        Returns (messages, tools) where tools is None if the request had none.
+        """
         from agentic_swarm_bench.proxy.translators import anthropic_to_openai
 
         oai_body = anthropic_to_openai(body, model)
-        return oai_body.get("messages", [])
+        return oai_body.get("messages", []), oai_body.get("tools")
 
     @app.get("/recording/status")
     async def recording_status():
@@ -188,12 +191,14 @@ def create_recording_app(
 
         headers = _upstream_headers()
         messages_snapshot = oai_body.get("messages", [])
+        tools_snapshot = oai_body.get("tools")
 
         entry = {
             "seq": seq,
             "experiment_id": state["experiment_id"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "messages": messages_snapshot,
+            "tools": tools_snapshot,
             "model": oai_body.get("model", model),
             "max_tokens": oai_body.get("max_tokens", 4096),
             "temperature": oai_body.get("temperature", 1.0),
@@ -254,12 +259,14 @@ def create_recording_app(
         headers = _upstream_headers()
 
         oai_messages = _responses_input_to_oai_messages(body_json)
+        tools_snapshot = body_json.get("tools")
 
         entry = {
             "seq": seq,
             "experiment_id": state["experiment_id"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "messages": oai_messages,
+            "tools": tools_snapshot,
             "model": body_json.get("model", model),
             "max_tokens": body_json.get("max_output_tokens", 4096),
             "temperature": body_json.get("temperature", 1.0),
@@ -425,13 +432,14 @@ def create_recording_app(
             if val:
                 headers[h] = val
 
-        oai_messages = _anthropic_messages_to_openai(body_json)
+        oai_messages, oai_tools = _anthropic_messages_to_openai(body_json)
 
         entry = {
             "seq": seq,
             "experiment_id": state["experiment_id"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "messages": oai_messages,
+            "tools": oai_tools,
             "model": body_json.get("model", model),
             "max_tokens": body_json.get("max_tokens", 4096),
             "temperature": body_json.get("temperature", 1.0),
