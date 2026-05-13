@@ -4,7 +4,9 @@ from agentic_swarm_bench.tasks.registry import (
     filter_tasks,
     get_tasks,
     load_all_tasks,
+    parse_task_mix,
     parse_task_range,
+    select_task_mix,
 )
 
 
@@ -102,3 +104,69 @@ def test_get_tasks_combined():
         assert t["tier"] == "easy"
         num = int(t["id"][1:])
         assert 1 <= num <= 25
+
+
+def test_parse_task_mix_balanced_and_weighted():
+    assert parse_task_mix(None) == {}
+    assert parse_task_mix("balanced") == {}
+    assert parse_task_mix("trivial=1,easy=2,medium=4") == {
+        "trivial": 1.0,
+        "easy": 2.0,
+        "medium": 4.0,
+    }
+
+
+def test_parse_task_mix_rejects_invalid_values():
+    for spec in ("trivial", "unknown=1", "easy=0", "medium=-1", "hard=nope"):
+        try:
+            parse_task_mix(spec)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {spec!r}")
+
+
+def test_select_task_mix_balanced_one_per_tier():
+    tasks = get_tasks(task_range="p1-p100")
+
+    selected = select_task_mix(tasks, mix="balanced", count=5)
+
+    assert [task["tier"] for task in selected] == [
+        "trivial",
+        "easy",
+        "medium",
+        "hard",
+        "expert",
+    ]
+
+
+def test_select_task_mix_weighted_by_tier():
+    tasks = get_tasks(task_range="p1-p100")
+
+    selected = select_task_mix(
+        tasks,
+        mix="trivial=1,easy=2,medium=4,hard=2,expert=1",
+        count=10,
+    )
+
+    counts: dict[str, int] = {}
+    for task in selected:
+        counts[task["tier"]] = counts.get(task["tier"], 0) + 1
+    assert counts == {
+        "trivial": 1,
+        "easy": 2,
+        "medium": 4,
+        "hard": 2,
+        "expert": 1,
+    }
+
+
+def test_select_task_mix_seed_changes_task_identity_deterministically():
+    tasks = get_tasks(task_range="p1-p25")
+
+    selected_a = select_task_mix(tasks, mix="trivial=1,easy=1", count=4, seed=1)
+    selected_b = select_task_mix(tasks, mix="trivial=1,easy=1", count=4, seed=1)
+    selected_c = select_task_mix(tasks, mix="trivial=1,easy=1", count=4, seed=2)
+
+    assert [task["id"] for task in selected_a] == [task["id"] for task in selected_b]
+    assert [task["id"] for task in selected_a] != [task["id"] for task in selected_c]
