@@ -379,6 +379,7 @@ def _build_agent_command(
         return [
             *parts,
             "exec",
+            "--skip-git-repo-check",
             "-c",
             f'openai_base_url="http://localhost:{config.proxy_port}/v1"',
             "-c",

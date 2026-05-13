@@ -68,6 +68,7 @@ def test_build_agent_command_uses_codex_exec_with_proxy_config():
     assert _build_agent_command("codex", "do task", config=cfg) == [
         "codex",
         "exec",
+        "--skip-git-repo-check",
         "-c",
         'openai_base_url="http://localhost:19000/v1"',
         "-c",
