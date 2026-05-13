@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -10,11 +12,43 @@ import respx
 
 from agentic_swarm_bench.config import BenchmarkConfig
 from agentic_swarm_bench.runner.claude_code import (
+    AgentTaskResult,
+    _agent_report_payload,
     _cleanup_workdir,
+    _duration_stats,
+    _generate_agent_markdown_report,
     _preflight_check,
+    _save_agent_outputs,
     _start_proxy,
     _stop_proxy,
 )
+from agentic_swarm_bench.scenarios.schedule import Schedule
+
+
+def _dict_value(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return value
+
+
+def _list_value(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return value
+
+
+def _parse_json_payload(text: str) -> dict[str, object]:
+    decoder = json.JSONDecoder()
+    starts = [i for i, ch in enumerate(text) if ch == "{"]
+    for start in reversed(starts):
+        try:
+            payload, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+
+        trailing = text[start + end :].strip()
+        if trailing:
+            continue
+        return _dict_value(payload)
+    raise AssertionError("No complete JSON payload found in captured output")
 
 # ---------------------------------------------------------------------------
 # _preflight_check
@@ -182,3 +216,164 @@ async def test_start_proxy_returns_none_when_fastapi_missing():
         result = await _start_proxy(config)
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Agent task completion reporting
+# ---------------------------------------------------------------------------
+
+
+def test_duration_stats_includes_p90_and_p95():
+    results = [
+        AgentTaskResult(task_id=f"P{i}", task_tier="medium", elapsed_s=float(i))
+        for i in range(1, 6)
+    ]
+
+    stats = _duration_stats(results)
+
+    assert stats["count"] == 5
+    assert stats["p50"] == 3.0
+    assert stats["p90"] == 4.6
+    assert stats["p95"] == 4.8
+
+
+def test_agent_report_payload_groups_completion_by_tier_task_and_tag(tmp_path):
+    results = [
+        AgentTaskResult(
+            task_id="P1",
+            task_tier="trivial",
+            task_tags=["python", "basics"],
+            elapsed_s=1.0,
+            returncode=0,
+            stdout_chars=10,
+        ),
+        AgentTaskResult(
+            task_id="P2",
+            task_tier="easy",
+            task_tags=["python", "cli"],
+            elapsed_s=9.0,
+            returncode=0,
+            stdout_chars=20,
+        ),
+    ]
+
+    payload = _agent_report_payload(
+        config=BenchmarkConfig(endpoint="http://fake:8000", model="test-model"),
+        agent_cmd="claude",
+        schedule=Schedule(repetitions=1, max_concurrent=2, policy="round_robin"),
+        task_results=results,
+        proxy_summary={"total_requests": 3, "streaming_requests": 3},
+        workdir=tmp_path,
+    )
+
+    assert payload["model"] == "test-model"
+    assert payload["users"] == 2
+    completion = _dict_value(payload["completion_time_s"])
+    assert completion["p50"] == 5.0
+    assert completion["p90"] == 8.2
+
+    tiers = [_dict_value(row) for row in _list_value(payload["by_tier"])]
+    tasks = [_dict_value(row) for row in _list_value(payload["by_task"])]
+    tags = [_dict_value(row) for row in _list_value(payload["by_tag"])]
+    assert {row["name"] for row in tiers} == {"trivial", "easy"}
+    assert {row["name"] for row in tasks} == {"P1", "P2"}
+    assert "python" in {row["name"] for row in tags}
+
+
+def test_agent_markdown_report_contains_completion_percentiles(tmp_path):
+    payload = _agent_report_payload(
+        config=BenchmarkConfig(endpoint="http://fake:8000", model="test-model"),
+        agent_cmd="claude",
+        schedule=Schedule(repetitions=1, max_concurrent=1, policy="round_robin"),
+        task_results=[
+            AgentTaskResult(
+                task_id="P1",
+                task_tier="trivial",
+                task_tags=["python"],
+                elapsed_s=2.0,
+                returncode=0,
+                stdout_chars=10,
+            )
+        ],
+        proxy_summary={
+            "total_requests": 1,
+            "streaming_requests": 1,
+            "ttft_ms": {"median": 100, "p95": 150},
+        },
+        workdir=tmp_path,
+    )
+
+    report = _generate_agent_markdown_report(payload, json_path="agent.json")
+
+    assert "Task Completion Time" in report
+    assert "P90" in report
+    assert "P95" in report
+    assert "By Task Tier" in report
+    assert "LLM Request Summary" in report
+
+
+def test_save_agent_outputs_writes_markdown_and_json(tmp_path):
+    payload = _agent_report_payload(
+        config=BenchmarkConfig(endpoint="http://fake:8000", model="test-model"),
+        agent_cmd="claude",
+        schedule=Schedule(repetitions=1, max_concurrent=1, policy="round_robin"),
+        task_results=[
+            AgentTaskResult(
+                task_id="P1",
+                task_tier="trivial",
+                elapsed_s=1.0,
+                returncode=0,
+                stdout_chars=10,
+            )
+        ],
+        proxy_summary=None,
+        workdir=tmp_path,
+    )
+
+    output = tmp_path / "agent-report.md"
+    _save_agent_outputs(str(output), payload)
+
+    assert output.exists()
+    assert (tmp_path / "agent-report.json").exists()
+
+
+def test_save_agent_outputs_path_matrix(tmp_path):
+    payload = _agent_report_payload(
+        config=BenchmarkConfig(endpoint="http://fake:8000", model="test-model"),
+        agent_cmd="claude",
+        schedule=Schedule(repetitions=1, max_concurrent=1, policy="round_robin"),
+        task_results=[
+            AgentTaskResult(
+                task_id="P1",
+                task_tier="trivial",
+                elapsed_s=1.0,
+                returncode=0,
+                stdout_chars=10,
+            )
+        ],
+        proxy_summary=None,
+        workdir=tmp_path,
+    )
+
+    cases = [
+        ("agent-report.json", True),
+        ("agent-report.md", True),
+        ("agent-report", False),
+    ]
+    for output_path, expect_markdown in cases:
+        output = tmp_path / output_path
+        _save_agent_outputs(str(output), payload)
+
+        if expect_markdown:
+            assert output.exists()
+        else:
+            assert not output.exists()
+
+        if output.suffix == ".json":
+            json_path = output
+        elif output.suffix == ".md":
+            json_path = output.with_suffix(".json")
+        else:
+            json_path = Path(str(output) + ".json")
+        assert json_path.exists()
+        assert json.loads(json_path.read_text()) == payload
