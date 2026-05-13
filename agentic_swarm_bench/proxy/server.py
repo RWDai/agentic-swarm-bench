@@ -14,17 +14,9 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import httpx
-
-try:
-    import uvicorn
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, Response, StreamingResponse
-
-    HAS_FASTAPI = True
-except ImportError:
-    HAS_FASTAPI = False
 
 from agentic_swarm_bench.proxy.context import pad_messages_to_target
 from agentic_swarm_bench.proxy.translators import (
@@ -33,6 +25,29 @@ from agentic_swarm_bench.proxy.translators import (
     openai_to_anthropic_response,
 )
 from agentic_swarm_bench.proxy.utils import _detect_upstream_api, _strip_api_suffix
+
+JsonDict = dict[str, Any]
+
+uvicorn: Any = None
+FastAPI: Any = None
+JSONResponse: Any = None
+Response: Any = None
+StreamingResponse: Any = None
+
+if TYPE_CHECKING:
+    from fastapi import Request as FastAPIRequest
+else:
+    FastAPIRequest = Any
+
+try:
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi import Request as FastAPIRequest
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
+except ImportError:
+    pass
+
+HAS_FASTAPI = uvicorn is not None
 
 
 def create_app(
@@ -43,7 +58,7 @@ def create_app(
     context_target_tokens: int = 0,
     log_dir: str = "./traces",
     upstream_api: str | None = None,
-) -> "FastAPI":
+) -> Any:
     if not HAS_FASTAPI:
         raise ImportError(
             "FastAPI and uvicorn are required for the proxy. "
@@ -59,7 +74,7 @@ def create_app(
 
     state = {"request_counter": 0}
 
-    def _upstream_headers() -> dict:
+    def _upstream_headers() -> JsonDict:
         headers = {"Content-Type": "application/json"}
         if not api_key:
             return headers
@@ -114,14 +129,16 @@ def create_app(
         "/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
     )
-    async def proxy(request: Request, path: str):
+    async def proxy(request: FastAPIRequest, path: str):
         state["request_counter"] += 1
         req_id = state["request_counter"]
 
         body = await request.body()
         body_json = None
         is_streaming = False
-        is_messages_api = path.rstrip("/") in ("v1/messages",)
+        clean_path = path.rstrip("/")
+        is_messages_api = clean_path in ("v1/messages",)
+        is_openai_chat_api = clean_path in ("v1/chat/completions", "chat/completions")
 
         try:
             body_json = json.loads(body)
@@ -150,6 +167,18 @@ def create_app(
                 log_path,
             )
 
+        if is_openai_chat_api and body_json:
+            return await _handle_openai_chat(
+                req_id,
+                body_json,
+                is_streaming,
+                t_start,
+                upstream_url,
+                model,
+                api_key,
+                metrics_log,
+            )
+
         target = f"{upstream_url}/{path}"
         if request.url.query:
             target += f"?{request.url.query}"
@@ -175,7 +204,7 @@ def create_app(
     _ANTHROPIC_FORWARD_HEADERS = {"anthropic-version", "anthropic-beta"}
 
     async def _handle_anthropic_passthrough(
-        request: Request, req_id: int, body_json: dict, is_streaming: bool,
+        request: FastAPIRequest, req_id: int, body_json: JsonDict, is_streaming: bool,
         t_start: float, metrics_log_path: Path,
     ):
         """Forward Anthropic requests natively to an Anthropic upstream, capture metrics."""
@@ -191,7 +220,7 @@ def create_app(
         if model:
             body_json["model"] = model
 
-        metrics = {
+        metrics: JsonDict = {
             "req_id": req_id,
             "stream": is_streaming,
             "timestamp": datetime.now().isoformat(),
@@ -303,9 +332,166 @@ def create_app(
             with open(metrics_log_path, "a") as f:
                 f.write(json.dumps(metrics) + "\n")
 
+        if StreamingResponse is None:
+            raise ImportError("FastAPI response classes are unavailable")
         return StreamingResponse(_stream_anthropic(), media_type="text/event-stream")
 
     return app
+
+
+async def _handle_openai_chat(
+    req_id: int,
+    body_json: JsonDict,
+    is_streaming: bool,
+    t_start: float,
+    upstream_url: str,
+    model: str,
+    api_key: str,
+    metrics_log: Path,
+):
+    """Handle /v1/chat/completions pass-through and record OpenAI metrics."""
+    if model:
+        body_json["model"] = model
+
+    upstream = f"{_strip_api_suffix(upstream_url)}/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    if not is_streaming:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            response = await client.post(upstream, json=body_json, headers=headers)
+        t_end = time.perf_counter()
+        metrics: JsonDict = {
+            "req_id": req_id,
+            "stream": False,
+            "timestamp": datetime.now().isoformat(),
+            "total_time_s": round(t_end - t_start, 3),
+        }
+        try:
+            payload = response.json()
+            usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        except json.JSONDecodeError:
+            usage = {}
+        if usage.get("prompt_tokens"):
+            metrics["input_tokens_actual"] = usage["prompt_tokens"]
+        if usage.get("completion_tokens"):
+            metrics["output_tokens"] = usage["completion_tokens"]
+        if response.status_code != 200:
+            metrics["error"] = f"HTTP {response.status_code}: {response.text[:500]}"
+            print(f"[proxy] ERROR: OpenAI upstream returned HTTP {response.status_code}")
+        with open(metrics_log, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+        fwd_headers = {
+            k: v
+            for k, v in response.headers.items()
+            if k.lower() not in ("content-length", "content-encoding", "transfer-encoding")
+        }
+        if Response is None:
+            raise ImportError("FastAPI response classes are unavailable")
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=fwd_headers,
+        )
+
+    metrics: JsonDict = {
+        "req_id": req_id,
+        "stream": True,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    async def _stream_openai():
+        ttft = None
+        token_count = 0
+        first_content_time = None
+        last_content_time = None
+        input_tokens_actual = 0
+        output_tokens_actual = 0
+        upstream_error = None
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            async with client.stream("POST", upstream, json=body_json, headers=headers) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    upstream_error = (
+                        f"HTTP {response.status_code}: "
+                        f"{body.decode(errors='replace')[:500]}"
+                    )
+                    print(f"[proxy] ERROR: OpenAI upstream returned {upstream_error}")
+                    yield body
+                else:
+                    buffer = ""
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+                        buffer += chunk.decode(errors="replace")
+                        lines = buffer.splitlines(keepends=True)
+                        if lines and not lines[-1].endswith(("\n", "\r")):
+                            buffer = lines.pop()
+                        else:
+                            buffer = ""
+                        for raw_line in lines:
+                            line = raw_line.strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                continue
+                            try:
+                                event = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+
+                            usage = event.get("usage")
+                            if usage:
+                                input_tokens_actual = usage.get(
+                                    "prompt_tokens", input_tokens_actual,
+                                )
+                                output_tokens_actual = usage.get(
+                                    "completion_tokens", output_tokens_actual,
+                                )
+
+                            for choice in event.get("choices", []):
+                                delta = choice.get("delta", {})
+                                content = delta.get("content") or delta.get("reasoning_content")
+                                if not content:
+                                    continue
+                                now = time.perf_counter()
+                                if first_content_time is None:
+                                    first_content_time = now
+                                    ttft = (now - t_start) * 1000
+                                last_content_time = now
+                                token_count += 1
+
+        if output_tokens_actual > 0:
+            token_count = output_tokens_actual
+
+        t_end = time.perf_counter()
+        metrics["ttft_ms"] = round(ttft, 2) if ttft else None
+        metrics["total_time_s"] = round(t_end - t_start, 3)
+        metrics["output_tokens"] = token_count
+        if upstream_error:
+            metrics["error"] = upstream_error
+        if input_tokens_actual:
+            metrics["input_tokens_actual"] = input_tokens_actual
+
+        if first_content_time and last_content_time and token_count > 1:
+            decode_time = last_content_time - first_content_time
+            metrics["decode_time_s"] = round(decode_time, 3)
+            metrics["tok_per_sec"] = round(token_count / decode_time, 2) if decode_time > 0 else 0
+        else:
+            metrics["tok_per_sec"] = 0
+
+        input_for_prefill = input_tokens_actual or 0
+        if ttft and input_for_prefill:
+            metrics["prefill_tok_per_sec"] = round(input_for_prefill / (ttft / 1000), 2)
+
+        with open(metrics_log, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+
+    if StreamingResponse is None:
+        raise ImportError("FastAPI response classes are unavailable")
+    return StreamingResponse(_stream_openai(), media_type="text/event-stream")
 
 
 async def _handle_messages(
@@ -367,13 +553,19 @@ async def _handle_messages(
 
         with open(metrics_log, "a") as f:
             f.write(json.dumps(metrics) + "\n")
+        if JSONResponse is None:
+            raise ImportError("FastAPI response classes are unavailable")
         return JSONResponse(
             content=anthropic_resp,
             status_code=200 if response.status_code == 200 else 502,
         )
 
     msg_id = "msg_" + uuid.uuid4().hex[:24]
-    metrics = {"req_id": req_id, "stream": True, "timestamp": datetime.now().isoformat()}
+    metrics: JsonDict = {
+        "req_id": req_id,
+        "stream": True,
+        "timestamp": datetime.now().isoformat(),
+    }
 
     async def _stream():
         ttft = None
@@ -486,6 +678,8 @@ async def _handle_messages(
         with open(metrics_log, "a") as f:
             f.write(json.dumps(metrics) + "\n")
 
+    if StreamingResponse is None:
+        raise ImportError("FastAPI response classes are unavailable")
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
@@ -520,4 +714,6 @@ def run_proxy(
     print(f"  Context target: {context_target_tokens} tokens (0 = no padding)")
     print(f"  Traces: {log_dir}")
     print(f"  Metrics: http://localhost:{port}/benchmark/summary")
+    if uvicorn is None:
+        raise ImportError("uvicorn is unavailable")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")

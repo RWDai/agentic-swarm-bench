@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import respx
 
 fastapi = pytest.importorskip("fastapi")
 httpx = pytest.importorskip("httpx")
@@ -162,6 +163,36 @@ async def test_summary_non_streaming_entries(tmp_path):
     data = resp.json()
     assert data["total_requests"] == 2
     assert data["streaming_requests"] == 0
+
+
+async def test_openai_chat_passthrough_records_metrics(tmp_path):
+    app = create_app(upstream_url="http://fake:8000", model="test", log_dir=str(tmp_path))
+    with respx.mock:
+        respx.post("http://fake:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+                },
+            )
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"model": "ignored", "messages": [{"role": "user", "content": "hi"}]},
+            )
+
+    assert resp.status_code == 200
+    metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert metrics[0]["stream"] is False
+    assert metrics[0]["input_tokens_actual"] == 5
+    assert metrics[0]["output_tokens"] == 2
 
 
 # ---------------------------------------------------------------------------
