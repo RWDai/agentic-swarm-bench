@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any, cast
 
 import click
 from rich.console import Console
@@ -18,9 +19,9 @@ _HAS_SCHEDULER = False
 _HAS_EVALUATOR = False
 _HAS_CACHE_DEFEAT = False
 
-_POLICY_CHOICES = ["round_robin", "sequential"]
+_policy_choices = ["round_robin", "sequential"]
 if _HAS_SCHEDULER:
-    _POLICY_CHOICES += ["random", "interleaved_random"]
+    _policy_choices += ["random", "interleaved_random"]
 
 _AGENT_CMD_HELP = "Agent CLI command (default: claude)"
 
@@ -42,16 +43,19 @@ class DefaultGroup(click.Group):
         self._default_cmd = default
         self._default_if_no_args = default_if_no_args
 
-    def parse_args(self, ctx, args):
-        if not args and self._default_if_no_args:
-            args = [self._default_cmd]
-        return super().parse_args(ctx, args)
+    def parse_args(self, ctx, args: list[str]) -> list[str]:
+        safe_args = list(args)
+        if not safe_args and self._default_if_no_args and self._default_cmd is not None:
+            safe_args = [self._default_cmd]
+        return super().parse_args(ctx, safe_args)
 
-    def get_command(self, ctx, cmd_name):
+    def get_command(self, ctx, cmd_name: str):
         cmd = super().get_command(ctx, cmd_name)
         if cmd is not None:
             return cmd
         # Unknown token - treat it as the first arg of the default command.
+        if self._default_cmd is None:
+            return None
         ctx.meta["_default_arg0"] = cmd_name
         return super().get_command(ctx, self._default_cmd)
 
@@ -95,7 +99,7 @@ def _reject_users_flag(value):
     )
 
 
-def _merge_extra_body(extra_body_json: str | None, enable_thinking: bool) -> dict | None:
+def _merge_extra_body(extra_body_json: str | None, enable_thinking: bool) -> dict[str, Any] | None:
     """Parse --extra-body JSON and merge with --enable-thinking convenience flag.
 
     Returns ``None`` when neither is set so we don't put an empty dict in the
@@ -103,7 +107,7 @@ def _merge_extra_body(extra_body_json: str | None, enable_thinking: bool) -> dic
     """
     import json as _json
 
-    out: dict = {}
+    out: dict[str, Any] = {}
     if extra_body_json:
         try:
             parsed = _json.loads(extra_body_json)
@@ -126,10 +130,12 @@ def _merge_extra_body(extra_body_json: str | None, enable_thinking: bool) -> dic
     return out or None
 
 
-def _build_config_safe(**kwargs):
+def _build_config_safe(**kwargs: object):
     """Wrap build_config and convert TypeError (unknown YAML keys) to UsageError."""
     try:
-        return build_config(**kwargs)
+        config_file = cast(str | None, kwargs.get("config_file"))
+        cli_args = cast(dict[str, object] | None, kwargs.get("cli_args"))
+        return build_config(config_file=config_file, cli_args=cli_args)
     except TypeError as e:
         raise click.UsageError(str(e))
 
@@ -430,6 +436,14 @@ def eval(ctx, endpoint, model, api_key, api_key_header, tasks, validate, context
 @click.option("--proxy-port", type=int, default=19000, help="Proxy listen port")
 @click.option("--output", "-o", default=None, help="Save results to file")
 @click.option(
+    "--json",
+    "json_stdout",
+    is_flag=True,
+    default=False,
+    help="Write JSON results to stdout (human output goes to stderr). "
+    "For piping into other tools.",
+)
+@click.option(
     "--upstream-api",
     type=click.Choice(["openai", "anthropic"]),
     default=None,
@@ -455,7 +469,7 @@ def eval(ctx, endpoint, model, api_key, api_key_header, tasks, validate, context
 )
 @click.option(
     "--policy",
-    type=click.Choice(_POLICY_CHOICES),
+    type=click.Choice(_policy_choices),
     default="random" if _HAS_SCHEDULER else "round_robin",
     show_default=True,
     help="Schedule-task ordering. "
@@ -484,7 +498,7 @@ def eval(ctx, endpoint, model, api_key, api_key_header, tasks, validate, context
 @click.pass_context
 def agent(
     ctx, endpoint, model, api_key, api_key_header, tasks,
-    agent_cmd, proxy_port, output, upstream_api,
+    agent_cmd, proxy_port, output, json_stdout, upstream_api,
     repetitions, max_concurrent, policy, seed, timeout,
 ):
     """Run full agentic benchmark through the recording proxy.
@@ -524,6 +538,7 @@ def agent(
             "task_range": tasks,
             "proxy_port": proxy_port,
             "output": output,
+            "json_stdout": json_stdout,
             "upstream_api": upstream_api,
             "timeout": timeout,
         },
@@ -795,7 +810,7 @@ def record(ctx, endpoint, model, api_key, api_key_header, port, output, upstream
 )
 @click.option(
     "--policy",
-    type=click.Choice(_POLICY_CHOICES),
+    type=click.Choice(_policy_choices),
     default="round_robin",
     help="Task execution order. "
     + ("round_robin, sequential, random, or interleaved_random. "

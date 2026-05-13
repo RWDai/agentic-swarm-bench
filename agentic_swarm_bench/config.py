@@ -15,9 +15,9 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
-CONTEXT_PROFILES = {
+CONTEXT_PROFILES: dict[str, int] = {
     "fresh": 6_000,
     "short": 20_000,
     "medium": 40_000,
@@ -29,9 +29,9 @@ CONTEXT_PROFILES = {
 
 # Default sweep when --context-profile realistic (or no profile specified).
 # xl/xxl are opt-in via --context-profile or --model-context-length.
-REALISTIC_PROFILE_SEQUENCE = ["fresh", "short", "medium", "long", "full"]
+REALISTIC_PROFILE_SEQUENCE: list[str] = ["fresh", "short", "medium", "long", "full"]
 
-SUITE_CONFIGS = {
+SUITE_CONFIGS: dict[str, dict[str, list[str] | list[int]]] = {
     "quick": {
         "users": [1, 4, 8],
         "profiles": ["fresh"],
@@ -74,10 +74,11 @@ class BenchmarkConfig:
 
     # Arbitrary JSON merged into the streaming request body. Used to pass
     # vLLM-specific options like chat_template_kwargs.enable_thinking=true.
-    extra_body: Optional[dict] = None
+    extra_body: Optional[dict[str, object]] = None
 
     output: Optional[str] = None
     output_format: str = "markdown"
+    json_stdout: bool = False
     dry_run: bool = False
 
     agent: str = "claude-code"
@@ -106,10 +107,10 @@ class BenchmarkConfig:
         return [(u, profile, tokens) for profile, tokens in profile_tokens for u in users]
 
     def _resolve_users(self) -> list[int]:
+        user_list = [self.users]
         if self.suite and self.suite in SUITE_CONFIGS:
-            user_list = SUITE_CONFIGS[self.suite]["users"]
-        else:
-            user_list = [self.users]
+            raw_users = SUITE_CONFIGS[self.suite].get("users", [])
+            user_list = [u for u in raw_users if isinstance(u, int)]
 
         if self.max_users is not None:
             user_list = [u for u in user_list if u <= self.max_users]
@@ -123,7 +124,8 @@ class BenchmarkConfig:
             return [(label, self.context_tokens)]
 
         if self.suite and self.suite in SUITE_CONFIGS:
-            profiles = SUITE_CONFIGS[self.suite]["profiles"]
+            raw_profiles = SUITE_CONFIGS[self.suite].get("profiles", [])
+            profiles = [p for p in raw_profiles if isinstance(p, str)]
             return [(p, CONTEXT_PROFILES[p]) for p in profiles]
 
         if self.context_profile and self.context_profile != "realistic":
@@ -200,7 +202,7 @@ def _int_or_none(val: Optional[str]) -> Optional[int]:
         return None
 
 
-def load_yaml_config(path: str) -> dict:
+def load_yaml_config(path: str) -> dict[str, object]:
     p = Path(path)
     if not p.exists():
         return {}
@@ -208,13 +210,14 @@ def load_yaml_config(path: str) -> dict:
         import yaml
 
         with open(p) as f:
-            return yaml.safe_load(f) or {}
+            data = yaml.safe_load(f) or {}
+            return cast(dict[str, object], data) if isinstance(data, dict) else {}
     except ImportError:
         return {}
 
 
 def build_config(
-    cli_args: Optional[dict] = None,
+    cli_args: Optional[dict[str, object]] = None,
     config_file: Optional[str] = None,
 ) -> BenchmarkConfig:
     """Build final config: CLI > env > YAML > defaults."""
@@ -232,7 +235,7 @@ def build_config(
         cfg = cfg.merge(**yaml_data)
 
     env_cfg = BenchmarkConfig.from_env()
-    env_overrides = {}
+    env_overrides: dict[str, object] = {}
     for k in cfg.__dataclass_fields__:
         env_val = getattr(env_cfg, k)
         default_val = getattr(BenchmarkConfig(), k)
