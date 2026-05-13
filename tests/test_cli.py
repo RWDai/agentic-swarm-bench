@@ -188,7 +188,15 @@ def test_agent_schedule_flags_in_help():
     """agent command must expose --repetitions, --max-concurrent, --policy, --seed."""
     result = RUNNER.invoke(main, ["agent", "--help"])
     assert result.exit_code == 0
-    for flag in ("--repetitions", "--max-concurrent", "--policy", "--seed", "--json"):
+    for flag in (
+        "--repetitions",
+        "--max-concurrent",
+        "--policy",
+        "--seed",
+        "--json",
+        "--task-mix",
+        "--task-count",
+    ):
         assert flag in result.output, f"missing {flag} in agent --help"
 
 
@@ -241,4 +249,3 @@ def test_speed_dry_run_sample_uses_actual_context():
     )
     assert result.exit_code == 0, result.output
     assert "P1 at 70K" in result.output
-

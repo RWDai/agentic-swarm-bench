@@ -55,6 +55,8 @@ class BenchmarkConfig:
     api_key_header: str = "Authorization"
 
     task_range: Optional[str] = None
+    task_mix: Optional[str] = None
+    task_count: Optional[int] = None
     tier: Optional[str] = None
     tags: Optional[list[str]] = None
 

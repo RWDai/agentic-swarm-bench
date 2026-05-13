@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -36,7 +37,7 @@ from agentic_swarm_bench.scenarios.schedule import (
     build_execution_queue,
     run_work_queue,
 )
-from agentic_swarm_bench.tasks.registry import get_tasks
+from agentic_swarm_bench.tasks.registry import get_tasks, select_task_mix
 
 JsonDict = dict[str, object]
 DurationStats = dict[str, float | int]
@@ -113,6 +114,12 @@ async def run_agent_benchmark(
     tasks: list[JsonDict] = get_tasks(task_range=config.task_range)
     if not tasks:
         tasks = get_tasks(task_range="p1-p10")
+    tasks = select_task_mix(
+        tasks,
+        mix=config.task_mix,
+        count=config.task_count,
+        seed=schedule.seed,
+    )
 
     workdir = Path(tempfile.mkdtemp(prefix="agentic-swarm-bench-"))
 
@@ -125,6 +132,10 @@ async def run_agent_benchmark(
     console.print(f"  Agent: {agent_cmd}")
     console.print(f"  Proxy port: {config.proxy_port}")
     console.print(f"  Tasks: {len(tasks)}")
+    if config.task_mix or config.task_count:
+        console.print(f"  Task mix: {config.task_mix or 'balanced'}")
+        if config.task_count:
+            console.print(f"  Distinct task count: {config.task_count}")
     console.print(f"  Schedule: {schedule.policy}"
                   f" × {schedule.repetitions} reps"
                   f" (max {schedule.max_concurrent} parallel agents)")
@@ -156,6 +167,8 @@ async def run_agent_benchmark(
             env["ANTHROPIC_AUTH_TOKEN"] = "agentic-swarm-bench"
             env["ANTHROPIC_MODEL"] = config.model
             env["CLAUDE_MODEL"] = config.model
+            env["CODEX_API_KEY"] = "agentic-swarm-bench"
+            env["OPENAI_API_KEY"] = "agentic-swarm-bench"
             env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
 
         state = _AgentRunState()
@@ -171,6 +184,7 @@ async def run_agent_benchmark(
                 slot_id=slot_id,
                 total=total_schedule_tasks,
                 agent_cmd=agent_cmd,
+                config=config,
                 env=env,
                 workdir=workdir,
                 timeout=config.timeout,
@@ -235,6 +249,7 @@ async def _run_one_agent_task(
     slot_id: int,
     total: int,
     agent_cmd: str,
+    config: BenchmarkConfig,
     env: dict[str, str],
     workdir: Path,
     timeout: float,
@@ -255,7 +270,7 @@ async def _run_one_agent_task(
     console.print(f"\n  [slot {slot_id}] start {label}: {preview}...")
 
     t_start = time.perf_counter()
-    _cmd_argv = [agent_cmd, "--print", prompt]
+    _cmd_argv = _build_agent_command(agent_cmd, prompt, config=config)
     try:
         proc = await asyncio.create_subprocess_exec(
             *_cmd_argv,
@@ -346,6 +361,33 @@ async def _run_one_agent_task(
         stderr_chars=len(stderr),
         error=None if returncode == 0 else f"exit={returncode}",
     )
+
+
+def _build_agent_command(
+    agent_cmd: str,
+    prompt: str,
+    *,
+    config: BenchmarkConfig,
+) -> list[str]:
+    """Build a non-interactive agent command for known agent CLIs."""
+    parts = shlex.split(agent_cmd)
+    if not parts:
+        raise ValueError("agent_cmd must not be empty")
+
+    executable = Path(parts[0]).name
+    if executable == "codex" and len(parts) == 1:
+        return [
+            *parts,
+            "exec",
+            "-c",
+            f'openai_base_url="http://localhost:{config.proxy_port}/v1"',
+            "-c",
+            f'model="{config.model}"',
+            prompt,
+        ]
+    if executable == "claude" and len(parts) == 1:
+        return [*parts, "--print", prompt]
+    return [*parts, prompt]
 
 
 def _percentile(values: list[float], percentile: float) -> float:

@@ -14,6 +14,7 @@ from agentic_swarm_bench.config import BenchmarkConfig
 from agentic_swarm_bench.runner.claude_code import (
     AgentTaskResult,
     _agent_report_payload,
+    _build_agent_command,
     _cleanup_workdir,
     _duration_stats,
     _generate_agent_markdown_report,
@@ -49,6 +50,41 @@ def _parse_json_payload(text: str) -> dict[str, object]:
             continue
         return _dict_value(payload)
     raise AssertionError("No complete JSON payload found in captured output")
+
+
+def test_build_agent_command_uses_claude_print_by_default():
+    cfg = BenchmarkConfig(model="test-model", proxy_port=19000)
+
+    assert _build_agent_command("claude", "do task", config=cfg) == [
+        "claude",
+        "--print",
+        "do task",
+    ]
+
+
+def test_build_agent_command_uses_codex_exec_with_proxy_config():
+    cfg = BenchmarkConfig(model="test-model", proxy_port=19000)
+
+    assert _build_agent_command("codex", "do task", config=cfg) == [
+        "codex",
+        "exec",
+        "-c",
+        'openai_base_url="http://localhost:19000/v1"',
+        "-c",
+        'model="test-model"',
+        "do task",
+    ]
+
+
+def test_build_agent_command_appends_prompt_to_custom_command():
+    cfg = BenchmarkConfig(model="test-model", proxy_port=19000)
+
+    assert _build_agent_command("my-agent --flag 'two words'", "do task", config=cfg) == [
+        "my-agent",
+        "--flag",
+        "two words",
+        "do task",
+    ]
 
 # ---------------------------------------------------------------------------
 # _preflight_check

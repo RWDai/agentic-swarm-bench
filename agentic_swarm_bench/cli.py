@@ -23,7 +23,11 @@ _policy_choices = ["round_robin", "sequential"]
 if _HAS_SCHEDULER:
     _policy_choices += ["random", "interleaved_random"]
 
-_AGENT_CMD_HELP = "Agent CLI command (default: claude)"
+_AGENT_CMD_HELP = (
+    "Agent CLI command. Built-ins: 'claude' uses `claude --print`; "
+    "'codex' uses `codex exec`. Custom commands receive the task prompt "
+    "as the final argument."
+)
 
 
 class DefaultGroup(click.Group):
@@ -432,6 +436,19 @@ def eval(ctx, endpoint, model, api_key, api_key_header, tasks, validate, context
     help="Header name for the API key",
 )
 @click.option("--tasks", "-t", default="p1-p10", help="Task range")
+@click.option(
+    "--task-mix",
+    default=None,
+    help="Tier mix for selected tasks. Use 'balanced' or weights like "
+    "'trivial=1,easy=2,medium=4,hard=2,expert=1'.",
+)
+@click.option(
+    "--task-count",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Number of distinct tasks to select from --tasks using --task-mix. "
+    "Use with --max-concurrent to simulate X users on X different tasks.",
+)
 @click.option("--agent-cmd", default="claude", help=_AGENT_CMD_HELP)
 @click.option("--proxy-port", type=int, default=19000, help="Proxy listen port")
 @click.option("--output", "-o", default=None, help="Save results to file")
@@ -497,7 +514,7 @@ def eval(ctx, endpoint, model, api_key, api_key_header, tasks, validate, context
 )
 @click.pass_context
 def agent(
-    ctx, endpoint, model, api_key, api_key_header, tasks,
+    ctx, endpoint, model, api_key, api_key_header, tasks, task_mix, task_count,
     agent_cmd, proxy_port, output, json_stdout, upstream_api,
     repetitions, max_concurrent, policy, seed, timeout,
 ):
@@ -524,6 +541,10 @@ def agent(
       asb agent -e URL -m MODEL -t p1-p10
       asb agent -e URL -m MODEL -t p1-p10 -r 4 --max-concurrent 4
       asb agent -e URL -m MODEL -t p1-p10 -r 4 --max-concurrent 4 --seed 42
+      asb agent -e URL -m MODEL -t p1-p100 --task-count 8 --max-concurrent 8
+      asb agent -e URL -m MODEL -t p1-p100 --task-count 8 --max-concurrent 8 \
+        --task-mix trivial=1,easy=2,medium=4,hard=2,expert=1
+      asb agent -e URL -m MODEL -t p1-p10 --agent-cmd codex
     """
     from agentic_swarm_bench.runner.claude_code import run_agent_benchmark
     from agentic_swarm_bench.scenarios.schedule import Schedule
@@ -536,6 +557,8 @@ def agent(
             "api_key": api_key or None,
             "api_key_header": api_key_header,
             "task_range": tasks,
+            "task_mix": task_mix,
+            "task_count": task_count,
             "proxy_port": proxy_port,
             "output": output,
             "json_stdout": json_stdout,
