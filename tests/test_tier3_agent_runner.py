@@ -14,11 +14,13 @@ from agentic_swarm_bench.config import BenchmarkConfig
 from agentic_swarm_bench.runner.claude_code import (
     AgentTaskResult,
     _agent_report_payload,
+    _AgentRunState,
     _build_agent_command,
     _cleanup_workdir,
     _duration_stats,
     _generate_agent_markdown_report,
     _preflight_check,
+    _run_one_agent_task,
     _save_agent_outputs,
     _start_proxy,
     _stop_proxy,
@@ -64,15 +66,30 @@ def test_build_agent_command_uses_claude_print_by_default():
 
 def test_build_agent_command_uses_codex_exec_with_proxy_config():
     cfg = BenchmarkConfig(model="test-model", proxy_port=19000)
+    output = Path("last-message.txt")
 
-    assert _build_agent_command("codex", "do task", config=cfg) == [
+    assert _build_agent_command(
+        "codex",
+        "do task",
+        config=cfg,
+        output_last_message=output,
+    ) == [
         "codex",
         "exec",
         "--skip-git-repo-check",
+        "--ephemeral",
+        "--sandbox",
+        "workspace-write",
+        "--color",
+        "never",
+        "--output-last-message",
+        "last-message.txt",
         "-c",
         'openai_base_url="http://localhost:19000/v1"',
         "-c",
         'model="test-model"',
+        "-c",
+        'approval_policy="never"',
         "do task",
     ]
 
@@ -86,6 +103,54 @@ def test_build_agent_command_appends_prompt_to_custom_command():
         "two words",
         "do task",
     ]
+
+
+async def test_run_one_agent_task_uses_last_message_when_stdout_empty(tmp_path):
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            task_dir = next(tmp_path.iterdir())
+            (task_dir / "last_message.txt").write_text("final codex answer")
+            return b"", b"OpenAI Codex v0.130.0\n"
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    task: dict[str, object] = {
+        "id": "P1",
+        "tier": "trivial",
+        "tags": [],
+        "prompt": "do task",
+    }
+    with patch("asyncio.create_subprocess_exec", fake_create_subprocess_exec):
+        result = await _run_one_agent_task(
+            task=task,
+            exec_idx=0,
+            slot_id=0,
+            total=1,
+            agent_cmd="codex",
+            config=BenchmarkConfig(model="test-model", proxy_port=19000),
+            env={},
+            workdir=tmp_path,
+            timeout=1,
+            state=_AgentRunState(),
+        )
+
+    assert result.succeeded is True
+    assert result.empty_stdout is False
+    assert result.stdout_chars == len("final codex answer")
+
+
+def test_agent_task_result_zero_exit_empty_stdout_can_succeed():
+    result = AgentTaskResult(
+        task_id="P1",
+        task_tier="trivial",
+        returncode=0,
+        empty_stdout=True,
+    )
+
+    assert result.succeeded is True
 
 # ---------------------------------------------------------------------------
 # _preflight_check

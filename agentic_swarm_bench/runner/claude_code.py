@@ -64,12 +64,7 @@ class AgentTaskResult:
 
     @property
     def succeeded(self) -> bool:
-        return (
-            self.error is None
-            and not self.timed_out
-            and not self.empty_stdout
-            and self.returncode == 0
-        )
+        return self.error is None and not self.timed_out and self.returncode == 0
 
     def to_dict(self) -> JsonDict:
         return {
@@ -270,7 +265,13 @@ async def _run_one_agent_task(
     console.print(f"\n  [slot {slot_id}] start {label}: {preview}...")
 
     t_start = time.perf_counter()
-    _cmd_argv = _build_agent_command(agent_cmd, prompt, config=config)
+    last_message_file = task_dir / "last_message.txt"
+    _cmd_argv = _build_agent_command(
+        agent_cmd,
+        prompt,
+        config=config,
+        output_last_message=last_message_file,
+    )
     try:
         proc = await asyncio.create_subprocess_exec(
             *_cmd_argv,
@@ -325,6 +326,11 @@ async def _run_one_agent_task(
 
     elapsed = time.perf_counter() - t_start
 
+    if last_message_file.exists():
+        last_message = last_message_file.read_text(errors="replace")
+        if last_message.strip() and last_message not in stdout:
+            stdout = f"{stdout}\n{last_message}" if stdout.strip() else last_message
+
     log_file = workdir / f"slot{slot_id}_{task_id}_r{exec_idx}.log"
     log_file.write_text(stdout + ("\n--- STDERR ---\n" + stderr if stderr else ""))
 
@@ -368,6 +374,7 @@ def _build_agent_command(
     prompt: str,
     *,
     config: BenchmarkConfig,
+    output_last_message: Path | None = None,
 ) -> list[str]:
     """Build a non-interactive agent command for known agent CLIs."""
     parts = shlex.split(agent_cmd)
@@ -380,10 +387,21 @@ def _build_agent_command(
             *parts,
             "exec",
             "--skip-git-repo-check",
+            "--ephemeral",
+            "--sandbox",
+            "workspace-write",
+            "--color",
+            "never",
+            *(
+                ["--output-last-message", str(output_last_message)]
+                if output_last_message is not None else []
+            ),
             "-c",
             f'openai_base_url="http://localhost:{config.proxy_port}/v1"',
             "-c",
             f'model="{config.model}"',
+            "-c",
+            'approval_policy="never"',
             prompt,
         ]
     if executable == "claude" and len(parts) == 1:
