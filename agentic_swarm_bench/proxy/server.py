@@ -139,6 +139,7 @@ def create_app(
         clean_path = path.rstrip("/")
         is_messages_api = clean_path in ("v1/messages",)
         is_openai_chat_api = clean_path in ("v1/chat/completions", "chat/completions")
+        is_openai_responses_api = clean_path in ("v1/responses", "responses")
 
         try:
             body_json = json.loads(body)
@@ -169,6 +170,18 @@ def create_app(
 
         if is_openai_chat_api and body_json:
             return await _handle_openai_chat(
+                req_id,
+                body_json,
+                is_streaming,
+                t_start,
+                upstream_url,
+                model,
+                api_key,
+                metrics_log,
+            )
+
+        if is_openai_responses_api and body_json:
+            return await _handle_openai_responses(
                 req_id,
                 body_json,
                 is_streaming,
@@ -492,6 +505,379 @@ async def _handle_openai_chat(
     if StreamingResponse is None:
         raise ImportError("FastAPI response classes are unavailable")
     return StreamingResponse(_stream_openai(), media_type="text/event-stream")
+
+
+async def _handle_openai_responses(
+    req_id: int,
+    body_json: JsonDict,
+    is_streaming: bool,
+    t_start: float,
+    upstream_url: str,
+    model: str,
+    api_key: str,
+    metrics_log: Path,
+):
+    """Handle Codex /v1/responses requests through a chat-completions upstream.
+
+    Codex CLI v0.130 speaks OpenAI Responses API. Most ASB targets are
+    OpenAI-compatible chat-completions servers, so the proxy translates the
+    subset Codex needs for text/tool turns and emits Responses-shaped SSE.
+    """
+    chat_body = _responses_to_chat_completions(body_json, model)
+    upstream = f"{_strip_api_suffix(upstream_url)}/v1/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response_id = "resp_" + uuid.uuid4().hex
+
+    if not is_streaming:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            response = await client.post(upstream, json=chat_body, headers=headers)
+        t_end = time.perf_counter()
+        metrics = _openai_response_metrics(req_id, False, t_start, t_end, response)
+        with open(metrics_log, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+        if response.status_code != 200:
+            if JSONResponse is None:
+                raise ImportError("FastAPI response classes are unavailable")
+            return JSONResponse(
+                content=_responses_error_payload(response_id, response.status_code, response.text),
+                status_code=502,
+            )
+        payload = response.json()
+        if JSONResponse is None:
+            raise ImportError("FastAPI response classes are unavailable")
+        return JSONResponse(content=_chat_completion_to_responses(payload, response_id))
+
+    metrics: JsonDict = {
+        "req_id": req_id,
+        "stream": True,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    async def _stream_responses():
+        ttft = None
+        token_count = 0
+        first_content_time = None
+        last_content_time = None
+        input_tokens_actual = 0
+        output_tokens_actual = 0
+        upstream_error = None
+        text_parts: list[str] = []
+        tool_calls: dict[int, JsonDict] = {}
+
+        yield _responses_sse(
+            "response.created",
+            {"type": "response.created", "response": {"id": response_id}},
+        )
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            async with client.stream("POST", upstream, json=chat_body, headers=headers) as response:
+                if response.status_code != 200:
+                    body = await response.aread()
+                    upstream_error = (
+                        f"HTTP {response.status_code}: "
+                        f"{body.decode(errors='replace')[:500]}"
+                    )
+                    print(f"[proxy] ERROR: OpenAI upstream returned {upstream_error}")
+                    yield _responses_sse(
+                        "response.failed",
+                        _responses_error_payload(response_id, response.status_code, upstream_error),
+                    )
+                else:
+                    buffer = ""
+                    async for chunk in response.aiter_bytes():
+                        buffer += chunk.decode(errors="replace")
+                        lines = buffer.splitlines(keepends=True)
+                        if lines and not lines[-1].endswith(("\n", "\r")):
+                            buffer = lines.pop()
+                        else:
+                            buffer = ""
+                        for raw_line in lines:
+                            line = raw_line.strip()
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:].strip()
+                            if data_str == "[DONE]":
+                                continue
+                            try:
+                                event = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+
+                            usage = event.get("usage")
+                            if usage:
+                                input_tokens_actual = usage.get(
+                                    "prompt_tokens", input_tokens_actual,
+                                )
+                                output_tokens_actual = usage.get(
+                                    "completion_tokens", output_tokens_actual,
+                                )
+
+                            for choice in event.get("choices", []):
+                                delta = choice.get("delta", {})
+                                content = delta.get("content") or delta.get("reasoning_content")
+                                if content:
+                                    now = time.perf_counter()
+                                    if first_content_time is None:
+                                        first_content_time = now
+                                        ttft = (now - t_start) * 1000
+                                    last_content_time = now
+                                    token_count += 1
+                                    text_parts.append(content)
+                                    yield _responses_sse(
+                                        "response.output_text.delta",
+                                        {"type": "response.output_text.delta", "delta": content},
+                                    )
+
+                                for tc_delta in delta.get("tool_calls", []):
+                                    idx = int(tc_delta.get("index", 0))
+                                    tool_call = tool_calls.setdefault(
+                                        idx,
+                                        {
+                                            "type": "function_call",
+                                            "call_id": (
+                                                tc_delta.get("id")
+                                                or f"call_{uuid.uuid4().hex[:8]}"
+                                            ),
+                                            "name": "",
+                                            "arguments": "",
+                                        },
+                                    )
+                                    if tc_delta.get("id"):
+                                        tool_call["call_id"] = tc_delta["id"]
+                                    function_delta = tc_delta.get("function", {})
+                                    if function_delta.get("name"):
+                                        tool_call["name"] = function_delta["name"]
+                                    if function_delta.get("arguments"):
+                                        tool_call["arguments"] += function_delta["arguments"]
+
+        if output_tokens_actual > 0:
+            token_count = output_tokens_actual
+
+        text = "".join(text_parts)
+        if text:
+            message_id = "msg_" + uuid.uuid4().hex[:24]
+            yield _responses_sse(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "id": message_id,
+                        "content": [{"type": "output_text", "text": text}],
+                    },
+                },
+            )
+        for tool_call in tool_calls.values():
+            yield _responses_sse(
+                "response.output_item.done",
+                {"type": "response.output_item.done", "item": tool_call},
+            )
+        yield _responses_sse("response.completed", _responses_completed_payload(response_id))
+
+        t_end = time.perf_counter()
+        metrics["ttft_ms"] = round(ttft, 2) if ttft else None
+        metrics["total_time_s"] = round(t_end - t_start, 3)
+        metrics["output_tokens"] = token_count
+        if upstream_error:
+            metrics["error"] = upstream_error
+        if input_tokens_actual:
+            metrics["input_tokens_actual"] = input_tokens_actual
+        if first_content_time and last_content_time and token_count > 1:
+            decode_time = last_content_time - first_content_time
+            metrics["decode_time_s"] = round(decode_time, 3)
+            metrics["tok_per_sec"] = round(token_count / decode_time, 2) if decode_time > 0 else 0
+        else:
+            metrics["tok_per_sec"] = 0
+        if ttft and input_tokens_actual:
+            metrics["prefill_tok_per_sec"] = round(input_tokens_actual / (ttft / 1000), 2)
+        with open(metrics_log, "a") as f:
+            f.write(json.dumps(metrics) + "\n")
+
+    if StreamingResponse is None:
+        raise ImportError("FastAPI response classes are unavailable")
+    return StreamingResponse(_stream_responses(), media_type="text/event-stream")
+
+
+def _responses_to_chat_completions(body: JsonDict, model: str) -> JsonDict:
+    messages: list[JsonDict] = []
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions:
+        messages.append({"role": "system", "content": instructions})
+
+    for item in body.get("input", []):
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type == "message":
+            role = str(item.get("role", "user"))
+            if role == "developer":
+                role = "system"
+            if role not in {"system", "user", "assistant", "tool"}:
+                role = "user"
+            messages.append({"role": role, "content": _responses_content_text(item.get("content"))})
+        elif item_type == "function_call_output":
+            messages.append({
+                "role": "tool",
+                "tool_call_id": str(item.get("call_id", "")),
+                "content": _responses_content_text(item.get("output")),
+            })
+
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+
+    chat_body: JsonDict = {
+        "model": model or str(body.get("model", "")),
+        "messages": messages,
+        "stream": bool(body.get("stream", True)),
+        "stream_options": {"include_usage": True},
+    }
+    if body.get("max_output_tokens"):
+        chat_body["max_tokens"] = body["max_output_tokens"]
+
+    tools = _responses_tools_to_chat_tools(body.get("tools"))
+    if tools:
+        chat_body["tools"] = tools
+    return chat_body
+
+
+def _responses_content_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("output_text") or block.get("input_text")
+                if text is not None:
+                    parts.append(str(text))
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _responses_tools_to_chat_tools(tools: object) -> list[JsonDict]:
+    if not isinstance(tools, list):
+        return []
+    converted: list[JsonDict] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") != "function":
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        converted.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
+            },
+        })
+    return converted
+
+
+def _chat_completion_to_responses(payload: JsonDict, response_id: str) -> JsonDict:
+    choice = payload.get("choices", [{}])[0]
+    message = choice.get("message", {}) if isinstance(choice, dict) else {}
+    output: list[JsonDict] = []
+    content = message.get("content")
+    if content:
+        output.append({
+            "type": "message",
+            "role": "assistant",
+            "id": "msg_" + uuid.uuid4().hex[:24],
+            "content": [{"type": "output_text", "text": content}],
+        })
+    for tc in message.get("tool_calls", []):
+        function = tc.get("function", {})
+        output.append({
+            "type": "function_call",
+            "call_id": tc.get("id", "call_" + uuid.uuid4().hex[:8]),
+            "name": function.get("name", ""),
+            "arguments": function.get("arguments", ""),
+        })
+    return {
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "output": output,
+        "usage": _responses_usage(payload.get("usage", {})),
+    }
+
+
+def _openai_response_metrics(
+    req_id: int, is_streaming: bool, t_start: float, t_end: float, response: httpx.Response,
+) -> JsonDict:
+    metrics: JsonDict = {
+        "req_id": req_id,
+        "stream": is_streaming,
+        "timestamp": datetime.now().isoformat(),
+        "total_time_s": round(t_end - t_start, 3),
+    }
+    try:
+        payload = response.json()
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+    except json.JSONDecodeError:
+        usage = {}
+    if usage.get("prompt_tokens"):
+        metrics["input_tokens_actual"] = usage["prompt_tokens"]
+    if usage.get("completion_tokens"):
+        metrics["output_tokens"] = usage["completion_tokens"]
+    if response.status_code != 200:
+        metrics["error"] = f"HTTP {response.status_code}: {response.text[:500]}"
+        print(f"[proxy] ERROR: OpenAI upstream returned HTTP {response.status_code}")
+    return metrics
+
+
+def _responses_usage(usage: object) -> JsonDict:
+    if not isinstance(usage, dict):
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    input_tokens = int(usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0)
+    output_tokens = int(usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": int(usage.get("total_tokens", input_tokens + output_tokens) or 0),
+    }
+
+
+def _responses_completed_payload(response_id: str) -> JsonDict:
+    return {
+        "type": "response.completed",
+        "response": {
+            "id": response_id,
+            "usage": {
+                "input_tokens": 0,
+                "input_tokens_details": None,
+                "output_tokens": 0,
+                "output_tokens_details": None,
+                "total_tokens": 0,
+            },
+        },
+    }
+
+
+def _responses_error_payload(response_id: str, status_code: int, message: str) -> JsonDict:
+    return {
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "error": {"code": f"http_{status_code}", "message": message[:500]},
+        },
+    }
+
+
+def _responses_sse(event: str, payload: JsonDict) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
 
 
 async def _handle_messages(

@@ -195,6 +195,108 @@ async def test_openai_chat_passthrough_records_metrics(tmp_path):
     assert metrics[0]["output_tokens"] == 2
 
 
+async def test_openai_responses_translates_to_chat_completions(tmp_path):
+    app = create_app(upstream_url="http://fake:8000", model="test-model", log_dir=str(tmp_path))
+    with respx.mock:
+        route = respx.post("http://fake:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                },
+            )
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "ignored",
+                    "stream": False,
+                    "instructions": "be brief",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        }
+                    ],
+                },
+            )
+
+    assert resp.status_code == 200
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["model"] == "test-model"
+    assert sent["messages"] == [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "hi"},
+    ]
+    body = resp.json()
+    assert body["object"] == "response"
+    assert body["output"][0]["content"][0]["text"] == "done"
+    metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert metrics[0]["stream"] is False
+    assert metrics[0]["input_tokens_actual"] == 7
+    assert metrics[0]["output_tokens"] == 3
+
+
+async def test_openai_responses_stream_emits_responses_sse_and_metrics(tmp_path):
+    app = create_app(upstream_url="http://fake:8000", model="test-model", log_dir=str(tmp_path))
+    chat_sse = "".join(
+        [
+            'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+            (
+                'data: {"choices":[{"delta":{"content":"lo"}}],'
+                '"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\n'
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    with respx.mock:
+        respx.post("http://fake:8000/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                content=chat_sse,
+                headers={"content-type": "text/event-stream"},
+            )
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "ignored",
+                    "stream": True,
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "hi"}],
+                        }
+                    ],
+                },
+            )
+
+    assert resp.status_code == 200
+    text = resp.text
+    assert "event: response.created" in text
+    assert "event: response.output_text.delta" in text
+    assert "event: response.output_item.done" in text
+    assert "event: response.completed" in text
+    assert "hello" in text
+    metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert metrics[0]["stream"] is True
+    assert metrics[0]["input_tokens_actual"] == 4
+    assert metrics[0]["output_tokens"] == 2
+
+
 # ---------------------------------------------------------------------------
 # API key header forwarding
 # ---------------------------------------------------------------------------
